@@ -11,6 +11,11 @@ pub trait LanguageModel: Send {
     /// Observe that `sym` followed `context` in committed text.
     fn learn(&mut self, _context: &[u8], _sym: u8) {}
 
+    /// Remove a prior `learn(context, sym)` observation (the text was
+    /// retracted). Called in reverse commit order with identical contexts, so
+    /// implementations can restore their state exactly.
+    fn unlearn(&mut self, _context: &[u8], _sym: u8) {}
+
     fn alphabet_len(&self) -> usize;
 }
 

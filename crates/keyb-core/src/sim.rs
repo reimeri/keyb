@@ -109,11 +109,9 @@ pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64
                 revealing = true;
             }
             if revealing {
-                // Anchor the opposite edge so the expansion reveals the
-                // target side; gentle rate so delayed inputs don't overshoot
-                // past the frame boundary and force retractions.
-                let y = if y_des < 0.5 { 1.0 } else { 0.0 };
-                PointerInput { dx: -0.3, y, engaged: true }
+                // Point at the edge nearest the target: the vertical pan
+                // pulls it into view while a gentle zoom-out widens the view.
+                PointerInput { dx: -0.3, y: y_des.clamp(0.0, 1.0), engaged: true }
             } else {
                 PointerInput { dx: 1.0, y: y_des, engaged: true }
             }

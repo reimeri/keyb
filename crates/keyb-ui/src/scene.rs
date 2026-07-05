@@ -53,14 +53,14 @@ pub fn build(
         }
         let radius = (h * 0.15).min(10.0);
         let rect = RoundedRect::new(x0, cy0, lw, cy1, radius);
-        scene.fill(Fill::NonZero, t, box_color(b.sym, b.depth), None, &rect);
-        scene.stroke(
-            &Stroke::new(1.0),
-            t,
-            Color::from_rgba8(0, 0, 0, 60),
-            None,
-            &rect,
-        );
+        scene.fill(Fill::NonZero, t, box_color(b.sym, b.depth, b.on_path), None, &rect);
+        // Crosshair-path boxes (what will be written) get a bright edge.
+        let (stroke_c, stroke_w) = if b.on_path {
+            (Color::from_rgba8(0xFF, 0xFF, 0xFF, 150), 1.6)
+        } else {
+            (Color::from_rgba8(0, 0, 0, 60), 1.0)
+        };
+        scene.stroke(&Stroke::new(stroke_w), t, stroke_c, None, &rect);
 
         if h >= LABEL_MIN_PX {
             let label = engine.alphabet.label(b.sym).to_string();
@@ -106,11 +106,16 @@ pub fn build(
     );
     let font_px = 26.0f32;
     let text = engine.committed_text();
+    // Pending preview: text under the crosshair that will commit if the user
+    // keeps steering here — shown dim past the caret so letters appear the
+    // instant they are steered over, not only after the commit debounce.
+    let pending: String = engine.pending_text().chars().take(24).collect();
     let max_chars = ((lw - 60.0) / (font_px as f64 * 0.6)).max(4.0) as usize;
+    let budget = max_chars.saturating_sub(pending.chars().count()).max(4);
     let tail: String = text
         .chars()
         .rev()
-        .take(max_chars)
+        .take(budget)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -136,6 +141,15 @@ pub fn build(
             baseline + font_px as f64 * 0.15,
         ),
     );
+    if !pending.is_empty() {
+        let (glyphs, _) = fonts.layout(&pending.replace(' ', "\u{00B7}"), font_px);
+        scene
+            .draw_glyphs(&fonts.font)
+            .font_size(font_px)
+            .transform(t * Affine::translate((16.0 + adv as f64 + 12.0, baseline)))
+            .brush(Color::from_rgb8(0x6E, 0x76, 0x92))
+            .draw(Fill::NonZero, glyphs.into_iter());
+    }
 
     // Speed readout, bottom-left.
     let (glyphs, _) = fonts.layout(
@@ -151,10 +165,14 @@ pub fn build(
 }
 
 /// Golden-angle hue per symbol so neighbors in the column differ clearly;
-/// depth alternates lightness (SPEC §7.1 palette placeholder).
-fn box_color(sym: u8, depth: usize) -> Color {
+/// depth alternates lightness (SPEC §7.1 palette placeholder). Boxes on the
+/// crosshair path are lifted slightly so the pending text reads on canvas.
+fn box_color(sym: u8, depth: usize, on_path: bool) -> Color {
     let hue = (sym as f64 * 137.508) % 360.0;
-    let (s, l) = if depth % 2 == 0 { (0.42, 0.30) } else { (0.40, 0.38) };
+    let (s, mut l) = if depth % 2 == 0 { (0.42, 0.30) } else { (0.40, 0.38) };
+    if on_path {
+        l += 0.07;
+    }
     hsl(hue, s, l)
 }
 

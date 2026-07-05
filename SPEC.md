@@ -123,11 +123,18 @@ Standard Dasher dynamics, kept deliberately boring because they're proven:
 - Per frame: the view applies a zoom step `z = exp(k · dx · dt)` toward the point
   selected by `dy`, with the standard Dasher non-linearity that compresses extreme
   y-values so edge targets stay reachable.
+- **Vertical pan is independent of zoom** (M1 finding): the point under the
+  pointer drifts toward the view center at `pan_gain · k`, so pure vertical
+  pointer motion scrolls without zooming. Without this term, vertical position
+  only picks the zoom fixed-point and the user cannot "move up" — they must
+  zoom out and back in, which testers immediately flagged.
 - **Backward zoom is the only undo.** Zooming back across a commit boundary
   retracts committed text (§8.3). Retraction is debounced symmetrically with
-  commit (the view must stay outside the frame for the debounce period, one
-  level per period) — a hair-trigger retract turns steering overshoot into a
-  commit/retract limit cycle, found via the oracle harness in M1.
+  commit (the view must stay outside the deepest committed node for the
+  debounce period, one symbol per period) — a hair-trigger retract turns
+  steering overshoot into a commit/retract limit cycle, found via the oracle
+  harness in M1. Retraction touches only the text buffer and the LM
+  (`unlearn`), never geometry, so backing out cannot flash or reshuffle boxes.
 - **Adaptive speed**: max zoom rate `k` rises slowly (multiplicative increments)
   while steering is smooth and falls immediately on direction reversals/jitter —
   a port of Dasher's auto speed control. Novice mode = low initial cap.
@@ -139,10 +146,21 @@ deterministic, unit-testable, and replayable from logged pointer traces (§11).
 
 ### 5.3 Numerics
 
-Deep zooms exhaust f64 mantissa in the root frame. On each commit (§8.3) the
-frame is **rebased**: the committed node's interval is rescaled to `[0,1)` and its
-ancestors dropped. Invariant: the active view always spans ≥ 1e-6 of the current
-frame. This caps error without arbitrary-precision arithmetic.
+Deep zooms exhaust f64 mantissa in the root frame. The frame is **decoupled
+from commits** (M1 finding — rebasing on every commit rebuilt the tree and
+made retraction flash): the tree survives commits and retractions untouched,
+and the frame moves only when numerics or the view demand it:
+
+- **Advance (forward)**: once the view spans < 1e-6 of the frame, the root
+  descends into committed children; coordinates are affinely rescaled in
+  place (no re-expansion, no visible change).
+- **Climb out (backward)**: if the view escapes the frame, one ledger level
+  pops immediately. The ledger stores each absorbed level's *complete child
+  partition*, so the parent is re-laid out exactly as it was on screen —
+  immune to LM drift — and the current tree is transplanted into its slot.
+
+This caps error without arbitrary-precision arithmetic and keeps rendering
+continuous through commit, undo, and rebase.
 
 ### 5.4 The alphabet is not just letters
 
@@ -253,6 +271,11 @@ spend the surplus so zooming never stalls:
   render once legible; below threshold boxes are color-only.
 - Committed text ribbon along the left edge (most recent ~60 chars), plus a
   faint full-sentence echo strip along the top.
+- **Pending preview** (M1 finding): the ribbon also shows, dimmed past the
+  caret, the uncommitted text under the crosshair path, and the boxes on that
+  path get a bright edge. Letters appear the instant they are steered over;
+  the commit debounce then merely brightens them. Without this, users can't
+  tell when input actually happens.
 
 ### 7.2 Frame loop
 

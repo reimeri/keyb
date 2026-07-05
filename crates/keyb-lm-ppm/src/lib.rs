@@ -109,6 +109,23 @@ impl LanguageModel for PpmModel {
         self.learn_at(context, sym);
     }
 
+    /// Exact inverse of `learn`: retracted text must leave no trace, so
+    /// re-expanded boxes match what was on screen before the commit.
+    fn unlearn(&mut self, context: &[u8], sym: u8) {
+        for k in 0..=self.order.min(context.len()) {
+            let key = &context[context.len() - k..];
+            if let Some(entry) = self.contexts.get_mut(key) {
+                if entry.counts[sym as usize] > 0 {
+                    entry.counts[sym as usize] -= 1;
+                    entry.total -= 1;
+                    if entry.counts[sym as usize] == 0 {
+                        entry.distinct -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn alphabet_len(&self) -> usize {
         self.n_sym
     }
@@ -141,6 +158,28 @@ mod tests {
         let e = p[a.index_of('e').unwrap() as usize];
         let q = p[a.index_of('q').unwrap() as usize];
         assert!(e > 10.0 * q, "e={e} q={q}");
+    }
+
+    #[test]
+    fn unlearn_restores_distribution_exactly() {
+        let a = Alphabet::english_v1();
+        let mut m = PpmModel::seeded(&a);
+        let probes = [a.encode(""), a.encode("th"), a.encode("the weather")];
+        let before: Vec<Vec<f64>> = probes.iter().map(|c| m.predict(c)).collect();
+        // Mirror engine usage: learn against the growing committed text,
+        // unlearn in reverse.
+        let mut committed = a.encode("mistyped junk");
+        let typed = a.encode("qzq qzq");
+        for &s in &typed {
+            m.learn(&committed, s);
+            committed.push(s);
+        }
+        for _ in 0..typed.len() {
+            let s = committed.pop().unwrap();
+            m.unlearn(&committed, s);
+        }
+        let after: Vec<Vec<f64>> = probes.iter().map(|c| m.predict(c)).collect();
+        assert_eq!(before, after);
     }
 
     #[test]
