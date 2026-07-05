@@ -46,6 +46,9 @@ pub struct EngineParams {
     pub max_depth: usize,
     /// Arena size that triggers compaction (dead-node garbage collection).
     pub max_nodes: usize,
+    /// Async distribution upgrades animate box sizes toward the new partition
+    /// over roughly this long (SPEC §6.3) so boxes never pop.
+    pub upgrade_anim_secs: f64,
 }
 
 impl Default for EngineParams {
@@ -59,6 +62,7 @@ impl Default for EngineParams {
             rebase_view_w: 1e-6,
             max_depth: 64,
             max_nodes: 4000,
+            upgrade_anim_secs: 0.12,
         }
     }
 }
@@ -73,6 +77,11 @@ struct Node {
     children: Vec<usize>,
     expanded: bool,
     alive: bool,
+    /// Child partition an async upgrade is animating toward:
+    /// `anim_target[k]..anim_target[k+1]` is child `k`'s destination
+    /// (`anim_target[0] == lo`, last == hi). Frame coordinates, so every
+    /// affine tree move remaps it alongside `lo`/`hi`.
+    anim_target: Option<Box<[f64]>>,
 }
 
 /// One frame-absorbed symbol: the parent frame's complete child partition
@@ -149,6 +158,10 @@ fn copy_subtree(
         children: Vec::new(),
         expanded: n.expanded,
         alive: true,
+        anim_target: n
+            .anim_target
+            .as_ref()
+            .map(|cuts| cuts.iter().map(|&c| offset + c * scale).collect()),
     });
     let mut kids = Vec::with_capacity(n.children.len());
     for &c in &n.children {
@@ -176,6 +189,7 @@ impl Engine {
                 children: Vec::new(),
                 expanded: false,
                 alive: true,
+                anim_target: None,
             }],
             view_lo: 0.0,
             view_hi: 1.0,
@@ -215,10 +229,137 @@ impl Engine {
         if input.engaged {
             self.zoom(input, dt);
         }
+        self.apply_upgrades();
+        self.animate_partitions(dt);
         self.climb_out_if_outside();
         self.maintain_tree();
+        self.send_frame_hint();
         self.update_commit(dt, input.engaged);
         self.advance_frame_if_deep();
+    }
+
+    /// Drain async LM upgrades (SPEC §6.3): a node expanded with fallback
+    /// sizing gets a target partition to animate toward. Nodes that vanished
+    /// (evicted, above the frame) are skipped — a re-expansion will hit the
+    /// LM's cache synchronously instead.
+    fn apply_upgrades(&mut self) {
+        for (ctx, dist) in self.lm.poll_upgrades() {
+            debug_assert_eq!(dist.len(), self.alphabet.len());
+            let Some(i) = self.node_for_context(&ctx) else { continue };
+            if !self.nodes[i].expanded || dist.len() != self.nodes[i].children.len() {
+                continue;
+            }
+            let (lo, hi) = (self.nodes[i].lo, self.nodes[i].hi);
+            let w = hi - lo;
+            let mut cuts = Vec::with_capacity(dist.len() + 1);
+            let mut acc = lo;
+            cuts.push(lo);
+            for &p in &dist[..dist.len() - 1] {
+                acc += p * w;
+                cuts.push(acc);
+            }
+            cuts.push(hi);
+            self.nodes[i].anim_target = Some(cuts.into());
+        }
+    }
+
+    /// Walk `context` (absolute: document start) down from the frame root.
+    fn node_for_context(&self, ctx: &[u8]) -> Option<usize> {
+        let prefix = &self.committed[..self.ledger.len()];
+        if !ctx.starts_with(prefix) {
+            return None; // frame advanced past this context, or text retracted
+        }
+        let mut cur = ROOT;
+        for &s in &ctx[prefix.len()..] {
+            if !self.nodes[cur].expanded {
+                return None;
+            }
+            cur = self.nodes[cur].children[s as usize];
+            if !self.nodes[cur].alive {
+                return None;
+            }
+        }
+        Some(cur)
+    }
+
+    /// Move animating partitions toward their targets (exponential approach,
+    /// ~95% converged in `upgrade_anim_secs`) and re-lay child subtrees
+    /// affinely into the new cuts. Runs even while disengaged so distributions
+    /// arriving during a pause still settle smoothly.
+    fn animate_partitions(&mut self, dt: f64) {
+        if dt <= 0.0 {
+            return;
+        }
+        // Time constant: 3τ ≈ full animation window.
+        let tau = (self.params.upgrade_anim_secs / 3.0).max(1e-3);
+        let blend = 1.0 - (-dt / tau).exp();
+        for i in 0..self.nodes.len() {
+            if !self.nodes[i].alive || self.nodes[i].anim_target.is_none() {
+                continue;
+            }
+            let target = self.nodes[i].anim_target.clone().expect("checked above");
+            let w = self.nodes[i].hi - self.nodes[i].lo;
+            let kids = self.nodes[i].children.clone();
+            debug_assert_eq!(kids.len() + 1, target.len());
+            let mut done = true;
+            let mut cursor = self.nodes[i].lo;
+            for (k, &c) in kids.iter().enumerate() {
+                let (old_lo, old_hi) = (self.nodes[c].lo, self.nodes[c].hi);
+                let new_hi = if k + 1 == kids.len() {
+                    self.nodes[i].hi
+                } else {
+                    let goal = target[k + 1];
+                    let stepped = old_hi + (goal - old_hi) * blend;
+                    let v = if (goal - stepped).abs() > 1e-4 * w {
+                        done = false;
+                        stepped
+                    } else {
+                        goal
+                    };
+                    v.max(cursor) // snap epsilon must never disorder cuts
+                };
+                self.remap_subtree(c, old_lo, old_hi, cursor, new_hi);
+                cursor = new_hi;
+            }
+            if done {
+                self.nodes[i].anim_target = None;
+            }
+        }
+    }
+
+    /// Affinely map the subtree at `i` from [old_lo, old_hi] to [lo, hi].
+    fn remap_subtree(&mut self, i: usize, old_lo: f64, old_hi: f64, lo: f64, hi: f64) {
+        let scale = (hi - lo) / (old_hi - old_lo).max(f64::MIN_POSITIVE);
+        let offset = lo - old_lo * scale;
+        let mut stack = vec![i];
+        while let Some(n) = stack.pop() {
+            let node = &mut self.nodes[n];
+            node.lo = offset + node.lo * scale;
+            node.hi = offset + node.hi * scale;
+            if let Some(cuts) = node.anim_target.as_mut() {
+                for c in cuts.iter_mut() {
+                    *c = offset + *c * scale;
+                }
+            }
+            stack.extend(node.children.iter().copied());
+        }
+        // Kill rounding drift at the seams: the subtree root sits exactly.
+        self.nodes[i].lo = lo;
+        self.nodes[i].hi = hi;
+    }
+
+    /// Tell the LM where the user is steering (deepest expanded node under
+    /// the view center) so it can re-prioritize and speculate (SPEC §6.6).
+    fn send_frame_hint(&mut self) {
+        let path = self.center_path();
+        let deepest_expanded = path
+            .iter()
+            .rev()
+            .find(|&&i| self.nodes[i].expanded)
+            .copied()
+            .unwrap_or(ROOT);
+        let ctx = self.context_of(deepest_expanded);
+        self.lm.frame_hint(&ctx);
     }
 
     fn zoom(&mut self, input: PointerInput, dt: f64) {
@@ -272,6 +413,7 @@ impl Engine {
             children: Vec::new(),
             expanded: true,
             alive: true,
+            anim_target: None,
         });
         let mut kids = Vec::with_capacity(n_sym);
         for i in 0..n_sym {
@@ -292,6 +434,7 @@ impl Engine {
                     children: Vec::new(),
                     expanded: false,
                     alive: true,
+                    anim_target: None,
                 });
                 kids.push(idx);
             }
@@ -410,6 +553,7 @@ impl Engine {
                 children: Vec::new(),
                 expanded: false,
                 alive: true,
+                anim_target: None,
             });
         }
         let n = &mut self.nodes[i];
@@ -418,10 +562,25 @@ impl Engine {
     }
 
     fn evict_children(&mut self, i: usize) {
+        // Cancel LM work for every expanded node about to disappear (§6.1).
+        // Contexts must be computed while parent links are still intact.
+        let mut expanded_ctxs = vec![self.context_of(i)];
+        let mut walk = self.nodes[i].children.clone();
+        while let Some(c) = walk.pop() {
+            if self.nodes[c].alive && self.nodes[c].expanded {
+                expanded_ctxs.push(self.context_of(c));
+            }
+            walk.extend(self.nodes[c].children.iter().copied());
+        }
+        for ctx in expanded_ctxs {
+            self.lm.release(&ctx);
+        }
         let mut stack = std::mem::take(&mut self.nodes[i].children);
         self.nodes[i].expanded = false;
+        self.nodes[i].anim_target = None;
         while let Some(c) = stack.pop() {
             self.nodes[c].alive = false;
+            self.nodes[c].anim_target = None;
             stack.extend(std::mem::take(&mut self.nodes[c].children));
         }
     }
@@ -777,6 +936,68 @@ mod tests {
         assert!(e.ledger.is_empty(), "frame back at document root");
         let cuts1: Vec<f64> = e.nodes[ROOT].children.iter().map(|&c| e.nodes[c].lo).collect();
         assert_eq!(cuts0, cuts1, "climb-out must restore geometry exactly");
+    }
+
+    /// Async double: answers uniform immediately, then upgrades the root
+    /// context to a peaked distribution on the second poll (the first poll of
+    /// a step precedes expansion, mirroring a real in-flight worker).
+    struct UpgradingModel {
+        n: usize,
+        polls: usize,
+        upgrade: Option<Vec<f64>>,
+    }
+
+    impl LanguageModel for UpgradingModel {
+        fn predict(&mut self, _context: &[u8]) -> Vec<f64> {
+            vec![1.0 / self.n as f64; self.n]
+        }
+
+        fn poll_upgrades(&mut self) -> Vec<(Vec<u8>, Vec<f64>)> {
+            self.polls += 1;
+            if self.polls < 2 {
+                return Vec::new();
+            }
+            self.upgrade.take().map(|d| (Vec::new(), d)).into_iter().collect()
+        }
+
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    #[test]
+    fn upgrade_animates_and_preserves_partition() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        // Upgrade: symbol 0 gets half the mass, rest uniform.
+        let mut target = vec![0.5 / (n - 1) as f64; n];
+        target[0] = 0.5;
+        let lm = UpgradingModel { n, polls: 0, upgrade: Some(target.clone()) };
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_viewport_px(1000.0);
+        // Step 1 expands the root with uniform sizing; step 2 receives the
+        // upgrade and starts animating.
+        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        let w_uniform = 1.0 / n as f64;
+        let first = e.nodes[ROOT].children[0];
+        let w0 = e.nodes[first].hi - e.nodes[first].lo;
+        assert!(w0 > w_uniform, "child 0 must start growing immediately: {w0}");
+        assert!(w0 < 0.5, "growth must be gradual, not a pop: {w0}");
+        // Partition invariant must hold on every animation frame.
+        for _ in 0..30 {
+            e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+            let mut cursor = 0.0;
+            for &c in &e.nodes[ROOT].children {
+                assert!((e.nodes[c].lo - cursor).abs() < 1e-12);
+                cursor = e.nodes[c].hi;
+            }
+            assert!((cursor - 1.0).abs() < 1e-12);
+        }
+        // ~0.5 s later the animation must have converged to the target.
+        let w1 = e.nodes[first].hi - e.nodes[first].lo;
+        assert!((w1 - 0.5).abs() < 1e-6, "must converge to upgraded size: {w1}");
+        assert!(e.nodes[ROOT].anim_target.is_none(), "animation must finish");
     }
 
     #[test]

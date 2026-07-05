@@ -16,6 +16,11 @@ pub struct OracleParams {
     pub max_secs: f64,
     /// How many symbols ahead the oracle aims (deeper = tighter target).
     pub lookahead: usize,
+    /// Pace simulated time to the wall clock. Required for async LMs (M2):
+    /// inference races real frames exactly as it would for a human, so the
+    /// measured WPM includes model latency. Synchronous models can leave this
+    /// off and run the sim as fast as the CPU allows.
+    pub realtime: bool,
 }
 
 impl Default for OracleParams {
@@ -29,6 +34,7 @@ impl Default for OracleParams {
             // the view at that box's center after the chain commit; aiming
             // several symbols in means the view lands on the next path.
             lookahead: 4,
+            realtime: false,
         }
     }
 }
@@ -72,6 +78,7 @@ pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64
     let mut rng = Rng(seed | 1);
     let mut delay_line: Vec<PointerInput> = Vec::new();
     let mut t = 0.0f64;
+    let wall_start = std::time::Instant::now();
     // Two-mode controller with hysteresis. Advancing while the target point is
     // inside the view can never commit off-path text (any node containing the
     // whole view then also contains the target point, i.e. is a prefix of the
@@ -128,6 +135,12 @@ pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64
 
         engine.step(input, p.dt);
         t += p.dt;
+        if p.realtime {
+            let ahead = t - wall_start.elapsed().as_secs_f64();
+            if ahead > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
+            }
+        }
     }
 
     let chars = engine.committed_syms().len();

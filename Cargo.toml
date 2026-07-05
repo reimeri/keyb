@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/keyb-core",
     "crates/keyb-lm-ppm",
+    "crates/keyb-lm-llama",
     "crates/keyb-ui",
     "crates/keyb-app",
 ]

@@ -16,7 +16,56 @@ pub trait LanguageModel: Send {
     /// implementations can restore their state exactly.
     fn unlearn(&mut self, _context: &[u8], _sym: u8) {}
 
+    /// Distributions that arrived asynchronously since the last call, as
+    /// (context, distribution) pairs. `predict` may answer with a fallback
+    /// (SPEC §6.3); when the real distribution lands, the engine re-partitions
+    /// the matching node and animates sizes so boxes never pop. Synchronous
+    /// models never upgrade.
+    fn poll_upgrades(&mut self) -> Vec<(Vec<u8>, Vec<f64>)> {
+        Vec::new()
+    }
+
+    /// Once-per-step hint: the context of the deepest expanded node under the
+    /// view center. Async backends re-prioritize pending work toward it and
+    /// speculatively expand its likely children (SPEC §6.6).
+    fn frame_hint(&mut self, _center_context: &[u8]) {}
+
+    /// The node for `context` was evicted; pending work for it may be
+    /// cancelled and any cache branch freed (SPEC §6.1, §6.5).
+    fn release(&mut self, _context: &[u8]) {}
+
     fn alphabet_len(&self) -> usize;
+}
+
+/// Boxes forward, so wrappers can be generic over owned or boxed models.
+impl<L: LanguageModel + ?Sized> LanguageModel for Box<L> {
+    fn predict(&mut self, context: &[u8]) -> Vec<f64> {
+        (**self).predict(context)
+    }
+
+    fn learn(&mut self, context: &[u8], sym: u8) {
+        (**self).learn(context, sym);
+    }
+
+    fn unlearn(&mut self, context: &[u8], sym: u8) {
+        (**self).unlearn(context, sym);
+    }
+
+    fn poll_upgrades(&mut self) -> Vec<(Vec<u8>, Vec<f64>)> {
+        (**self).poll_upgrades()
+    }
+
+    fn frame_hint(&mut self, center_context: &[u8]) {
+        (**self).frame_hint(center_context);
+    }
+
+    fn release(&mut self, context: &[u8]) {
+        (**self).release(context);
+    }
+
+    fn alphabet_len(&self) -> usize {
+        (**self).alphabet_len()
+    }
 }
 
 /// Uniform model — the floor every other model is smoothed against, and a

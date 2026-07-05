@@ -13,3 +13,4 @@ keyb-core = { path = "../keyb-core" }
 keyb-lm-ppm = { path = "../keyb-lm-ppm" }
 keyb-ui = { path = "../keyb-ui" }
 anyhow = "1"
+keyb-lm-llama = { path = "../keyb-lm-llama" }

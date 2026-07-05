@@ -1,0 +1,11 @@
+[package]
+name = "keyb-lm-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+keyb-core = { path = "../keyb-core" }
+keyb-lm-ppm = { path = "../keyb-lm-ppm" }
+llama-cpp-2 = "0.1"
+crossbeam-channel = "0.5"
