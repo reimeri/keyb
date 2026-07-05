@@ -124,7 +124,10 @@ Standard Dasher dynamics, kept deliberately boring because they're proven:
   selected by `dy`, with the standard Dasher non-linearity that compresses extreme
   y-values so edge targets stay reachable.
 - **Backward zoom is the only undo.** Zooming back across a commit boundary
-  retracts committed text (§8.3).
+  retracts committed text (§8.3). Retraction is debounced symmetrically with
+  commit (the view must stay outside the frame for the debounce period, one
+  level per period) — a hair-trigger retract turns steering overshoot into a
+  commit/retract limit cycle, found via the oracle harness in M1.
 - **Adaptive speed**: max zoom rate `k` rises slowly (multiplicative increments)
   while steering is smooth and falls immediately on direction reversals/jitter —
   a port of Dasher's auto speed control. Novice mode = low initial cap.
