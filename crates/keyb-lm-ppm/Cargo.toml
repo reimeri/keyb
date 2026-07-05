@@ -1,0 +1,8 @@
+[package]
+name = "keyb-lm-ppm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+keyb-core = { path = "../keyb-core" }

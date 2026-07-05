@@ -1,0 +1,15 @@
+[package]
+name = "keyb-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "keyb"
+path = "src/main.rs"
+
+[dependencies]
+keyb-core = { path = "../keyb-core" }
+keyb-lm-ppm = { path = "../keyb-lm-ppm" }
+keyb-ui = { path = "../keyb-ui" }
+anyhow = "1"

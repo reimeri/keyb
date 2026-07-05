@@ -1,0 +1,13 @@
+[package]
+name = "keyb-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+keyb-core = { path = "../keyb-core" }
+vello = "0.4"
+winit = "0.30"
+skrifa = "0.26"
+pollster = "0.4"
+anyhow = "1"
