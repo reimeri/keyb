@@ -28,19 +28,24 @@ pub const RIBBON_H: f64 = 56.0;
 /// Origin line: pointer right of this fraction of the canvas zooms in,
 /// left of it zooms out.
 pub const ORIGIN_X_FRAC: f64 = 0.18;
-/// Default height of the OSK strip (logical px) for the layer-shell and X11
-/// dock frontends. `KEYB_HEIGHT` overrides.
-pub const OSK_H: u32 = 380;
+/// Fallback width of the OSK column (logical px) for the layer-shell and X11
+/// dock frontends, used when the output size is unknown. `KEYB_WIDTH`
+/// overrides; otherwise the column is ~1/3 of the output width. The column is
+/// always full height.
+pub const OSK_W: u32 = 620;
 
 /// Receives committed-text changes once per frame, on the UI thread.
 pub type TextSink = Box<dyn FnMut(TextEvent)>;
 
-pub(crate) fn osk_height() -> u32 {
-    std::env::var("KEYB_HEIGHT")
+/// Width of the OSK column in logical px. `KEYB_WIDTH` (absolute px) wins;
+/// otherwise 1/3 of the output width when known, falling back to `OSK_W`.
+pub(crate) fn osk_width(output_w: Option<u32>) -> u32 {
+    std::env::var("KEYB_WIDTH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(OSK_H)
-        .clamp(160, 2000)
+        .or_else(|| output_w.map(|w| w / 3))
+        .unwrap_or(OSK_W)
+        .clamp(240, 3000)
 }
 
 /// Frame logic shared by both frontends: pointer mapping, engine stepping,

@@ -1,5 +1,5 @@
-//! Wayland wlr-layer-shell frontend (SPEC §7.3): an overlay strip anchored
-//! to the bottom edge with `keyboard_interactivity: none`, so the OSK can
+//! Wayland wlr-layer-shell frontend (SPEC §7.3): a full-height overlay column
+//! anchored to the right edge with `keyboard_interactivity: none`, so the OSK can
 //! *never* steal keyboard focus — clicks steer keyb while the compositor
 //! keeps keyboard focus (and therefore text-input activation and synthesized
 //! keys) on the target app.
@@ -40,7 +40,7 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-use crate::{osk_height, Core, Gpu};
+use crate::{osk_width, Core, Gpu};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
 const BTN_LEFT: u32 = 0x110;
@@ -114,6 +114,33 @@ impl AppState {
         self.layer.wl_surface().set_buffer_scale(self.scale);
     }
 
+    /// Size the column to ~1/3 of the output width (unless `KEYB_WIDTH` pins
+    /// it) once the compositor tells us the output's logical size. Re-commits
+    /// the layer surface if the width changed; the following `configure` then
+    /// carries the new size and calls `resize`.
+    fn apply_output_width(&mut self, output: &wl_output::WlOutput) {
+        if std::env::var_os("KEYB_WIDTH").is_some() {
+            return; // explicit override; ignore output size
+        }
+        let Some(info) = self.output_state.info(output) else {
+            return;
+        };
+        let ow = info
+            .logical_size
+            .map(|(w, _)| w)
+            .or_else(|| info.modes.iter().find(|m| m.current).map(|m| m.dimensions.0))
+            .filter(|w| *w > 0);
+        let Some(ow) = ow else {
+            return;
+        };
+        let want = osk_width(Some(ow as u32));
+        if want != self.width {
+            self.width = want;
+            self.layer.set_size(want, 0);
+            self.layer.commit();
+        }
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         if !self.configured || self.render_surface.is_none() {
             return;
@@ -178,9 +205,13 @@ impl OutputHandler for AppState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.apply_output_width(&output);
+    }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.apply_output_width(&output);
+    }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
@@ -199,8 +230,10 @@ impl LayerShellHandler for AppState {
         _serial: u32,
     ) {
         let (w, h) = configure.new_size;
-        self.width = if w == 0 { self.width.max(800) } else { w };
-        self.height = if h == 0 { osk_height() } else { h };
+        // Column: width from us, full height from the compositor. Keep the
+        // last-known value on a 0 (which shouldn't happen under TOP|BOTTOM).
+        self.width = if w == 0 { self.width } else { w };
+        self.height = if h == 0 { self.height } else { h };
         self.resize();
         let first = !self.configured;
         self.configured = true;
@@ -365,12 +398,14 @@ fn wayland_parts() -> Result<Parts> {
     let surface = compositor.create_surface(&qh);
     let layer =
         layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("keyb"), None);
-    let h = osk_height();
-    layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, h);
-    // Reserve the strip so tiled/maximized targets shift up instead of
-    // hiding their text field under the OSK.
-    layer.set_exclusive_zone(h as i32);
+    let w = osk_width(None);
+    // Full-height column on the right edge. Width fixed; height 0 = let the
+    // compositor fill top-to-bottom.
+    layer.set_anchor(Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
+    layer.set_size(w, 0);
+    // Overlay: reserve nothing so tiled/maximized windows keep their full size
+    // and the column floats over them.
+    layer.set_exclusive_zone(0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
 
@@ -396,7 +431,9 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
         conn: parts.conn.clone(),
         surface: parts.layer.wl_surface().clone(),
     };
-    let (w, h) = (800, osk_height());
+    // Placeholder until the first configure; corrected once the output size
+    // is known (`apply_output_width`) and the compositor sends the real height.
+    let (w, h) = (osk_width(None), 1080);
     let render_surface = match pollster::block_on(gpu.context.create_surface(
         handles,
         w,

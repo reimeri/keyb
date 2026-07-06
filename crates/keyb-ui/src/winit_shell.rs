@@ -1,5 +1,5 @@
 //! winit frontend: a plain window for development, or an X11
-//! override-redirect dock strip for OSK use (SPEC §7.3).
+//! override-redirect dock column for OSK use (SPEC §7.3).
 //!
 //! Override-redirect makes the window unmanaged: the WM never gives it
 //! keyboard focus, so clicks steer keyb while keystrokes keep flowing to the
@@ -17,7 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::{osk_height, Core, Gpu};
+use crate::{osk_width, Core, Gpu};
 
 struct RenderState {
     surface: vello::util::RenderSurface<'static>,
@@ -53,19 +53,27 @@ impl App {
         if !self.osk {
             return attrs.with_inner_size(LogicalSize::new(1200.0, 800.0));
         }
-        // Bottom strip across the primary monitor.
+        // Full-height column on the right edge of the primary monitor.
         let monitor = event_loop
             .primary_monitor()
             .or_else(|| event_loop.available_monitors().next());
         let (msize, mpos, mscale) = monitor
             .map(|m| (m.size(), m.position(), m.scale_factor()))
             .unwrap_or((PhysicalSize::new(1920, 1080), PhysicalPosition::new(0, 0), 1.0));
-        let h = (osk_height() as f64 * mscale) as u32;
+        // KEYB_WIDTH is logical px; otherwise 1/3 of the monitor. Widths here
+        // are physical, so scale the env override and pass the physical monitor
+        // width to `osk_width` for the 1/3 default.
+        let w = std::env::var("KEYB_WIDTH")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|lw| (lw * mscale) as u32)
+            .unwrap_or_else(|| osk_width(Some(msize.width)));
+        let w = w.clamp(1, msize.width);
         let attrs = attrs
-            .with_inner_size(PhysicalSize::new(msize.width, h))
+            .with_inner_size(PhysicalSize::new(w, msize.height))
             .with_position(PhysicalPosition::new(
-                mpos.x,
-                mpos.y + msize.height.saturating_sub(h) as i32,
+                mpos.x + msize.width.saturating_sub(w) as i32,
+                mpos.y,
             ))
             .with_decorations(false)
             .with_resizable(false);

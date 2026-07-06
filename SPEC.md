@@ -286,16 +286,19 @@ safe at 60 Hz).
 
 ### 7.3 Window behavior
 
-- Wayland: **wlr-layer-shell** surface (overlay layer, bottom-anchored strip,
-  exclusive zone so targets shift up), `keyboard_interactivity: none` — the
-  window can *never* steal keyboard focus. M3: winit has no layer-shell, so
-  this frontend speaks smithay-client-toolkit directly and bridges the raw
-  `wl_surface` into wgpu; `KEYB_SHELL`/`KEYB_HEIGHT` override frontend/size.
+- Wayland: **wlr-layer-shell** surface (overlay layer, full-height column
+  anchored to the **right edge**, ~1/3 of the output width, **no exclusive
+  zone** so it floats over targets without shrinking them) — the Dasher canvas
+  wants height, not width. `keyboard_interactivity: none` so the window can
+  *never* steal keyboard focus. M3: winit has no layer-shell, so this frontend
+  speaks smithay-client-toolkit directly and bridges the raw `wl_surface` into
+  wgpu. `KEYB_SHELL` overrides the frontend; `KEYB_WIDTH` (logical px) overrides
+  the column width (default: 1/3 of the output).
 - X11: winit window with override-redirect + `_NET_WM_WINDOW_TYPE_DOCK`
-  (unmanaged ⇒ the WM never focuses it).
+  (unmanaged ⇒ the WM never focuses it), same right-edge full-height column.
 - The pointer is *captured* while steering is engaged (button held): pointer-lock
   (relative motion) so the cursor can't wander off the OSK window mid-word.
-  M3: deferred to M4 — for now a pointer that leaves the strip disengages
+  M3: deferred to M4 — for now a pointer that leaves the column disengages
   steering (fail-safe against a stuck drag).
 
 ### 7.4 Settings
@@ -417,7 +420,7 @@ M3 findings (from the foot-under-headless-sway harness, §11):
 
 ## 13. Risks
 
-| Risk | Mitigation |
+| Risk | Mitigation |the players must 
 |---|---|
 | Wayland compositors gate `input-method-v2`/`virtual-keyboard-v1` | Three-tier backend fallback (§8); document per-compositor support; Flatpak portal story tracked separately. |
 | 0.5B model too weak → flat distributions → slow writing | Model is a config swap (1B–3B GGUF); oracle harness quantifies WPM-per-model so the trade is measured, not guessed. |
