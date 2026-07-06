@@ -83,6 +83,7 @@ pub fn build(
     lh: f64,
     scale: f64,
     input: PointerInput,
+    cursor: (f64, f64),
 ) {
     // Everything is laid out in logical px, then scaled once to physical.
     let t = Affine::scale(scale);
@@ -182,6 +183,17 @@ pub fn build(
         &Line::new((x_origin, RIBBON_H), (x_origin, lh)),
     );
     let cy = RIBBON_H + canvas_h / 2.0;
+    // While steering, trace the crosshair-to-cursor line first so the
+    // crosshair tick draws on top of it.
+    if input.engaged {
+        scene.stroke(
+            &Stroke::new(2.5),
+            t,
+            Color::from_rgba8(0xFF, 0x60, 0x60, 170),
+            None,
+            &Line::new((x_origin, cy), cursor),
+        );
+    }
     scene.stroke(
         &Stroke::new(2.0),
         t,

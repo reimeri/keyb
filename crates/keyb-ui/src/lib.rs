@@ -125,7 +125,7 @@ impl Core {
             (self.sink)(ev);
         }
 
-        scene::build(&mut self.scene, &self.engine, &self.fonts, lw, lh, scale, input);
+        scene::build(&mut self.scene, &self.engine, &self.fonts, lw, lh, scale, input, self.cursor);
     }
 }
 
