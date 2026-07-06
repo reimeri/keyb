@@ -280,18 +280,20 @@ pub fn build(
         .draw(Fill::NonZero, glyphs.into_iter());
 }
 
-/// Collapsed state: a small rounded tab filling the handle surface (`lw`x`lh`),
-/// with a centered chevron hinting "click to open". No engine data needed.
+/// Collapsed state: the small edge tab, with a centered chevron hinting "click
+/// to open". No engine data needed.
+///
+/// The surface itself is opaque (vello presents with no alpha), so a rounded
+/// tab would leave the dark clear color showing in the corners. Instead fill
+/// the whole surface with the tab color.
 pub fn build_handle(scene: &mut Scene, fonts: &FontAssets, lw: f64, lh: f64, scale: f64) {
     let t = Affine::scale(scale);
-    let tab = RoundedRect::new(2.0, 2.0, lw - 2.0, lh - 2.0, 8.0);
-    scene.fill(Fill::NonZero, t, Color::from_rgb8(0x24, 0x28, 0x38), None, &tab);
-    scene.stroke(
-        &Stroke::new(1.0),
+    scene.fill(
+        Fill::NonZero,
         t,
-        Color::from_rgba8(0xFF, 0xFF, 0xFF, 60),
+        Color::from_rgb8(0x24, 0x28, 0x38),
         None,
-        &tab,
+        &Rect::new(0.0, 0.0, lw, lh),
     );
     let font_px = (lw * 0.7) as f32;
     let (glyphs, adv) = fonts.layout("\u{2039}", font_px); // ‹
