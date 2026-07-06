@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use keyb_core::{Engine, PointerInput};
+use keyb_core::{Engine, GroupColor, PointerInput};
 use vello::kurbo::{Affine, Line, Rect, RoundedRect, Stroke};
 use vello::peniko::{Color, Fill};
 use vello::{Glyph, Scene};
@@ -35,6 +35,9 @@ const LABEL_PAD: f64 = 4.0;
 /// tall enough. `x0` is filled in by the width recurrence.
 struct BoxDraw {
     sym: u8,
+    /// Set for group boxes (capitals/digits/symbols) — drives a distinct,
+    /// popping color so the special boxes stand out from the letter palette.
+    group: Option<GroupColor>,
     depth: usize,
     on_path: bool,
     h: f64,
@@ -119,7 +122,7 @@ pub fn build(
             continue;
         }
         let (adv, label) = if h >= LABEL_MIN_PX {
-            let text = engine.alphabet.label(b.sym).to_string();
+            let text = b.label.to_string();
             let font_px = (h * 0.55).clamp(13.0, 64.0) as f32;
             let (glyphs, adv) = fonts.layout(&text, font_px);
             let baseline = (y0 + y1) / 2.0 + font_px as f64 * 0.35;
@@ -134,6 +137,7 @@ pub fn build(
             b.parent,
             BoxDraw {
                 sym: b.sym,
+                group: b.group,
                 depth: b.depth,
                 on_path: b.on_path,
                 h,
@@ -160,7 +164,11 @@ pub fn build(
     for (_, _, d) in draws {
         let radius = (d.h * 0.15).min(10.0);
         let rect = RoundedRect::new(d.x0, d.cy0, lw, d.cy1, radius);
-        scene.fill(Fill::NonZero, t, box_color(d.sym, d.depth, d.on_path), None, &rect);
+        let fill_color = match d.group {
+            Some(g) => group_color(g, d.depth, d.on_path),
+            None => box_color(d.sym, d.depth, d.on_path),
+        };
+        scene.fill(Fill::NonZero, t, fill_color, None, &rect);
         // Crosshair-path boxes (what will be written) get a bright edge.
         let (stroke_c, stroke_w) = if d.on_path {
             (Color::from_rgba8(0xFF, 0xFF, 0xFF, 150), 1.6)
@@ -357,6 +365,24 @@ pub fn build_handle(scene: &mut Scene, fonts: &FontAssets, lw: f64, lh: f64, sca
 fn box_color(sym: u8, depth: usize, on_path: bool) -> Color {
     let hue = (sym as f64 * 137.508) % 360.0;
     let (s, mut l) = if depth % 2 == 0 { (0.42, 0.30) } else { (0.40, 0.38) };
+    if on_path {
+        l += 0.07;
+    }
+    hsl(hue, s, l)
+}
+
+/// Distinct, highly-saturated colors for the special group boxes so they pop
+/// out of the muted per-letter palette (SPEC §5.4): capitals cyan, digits
+/// amber, symbols magenta. Depth still nudges lightness so nesting reads, and
+/// the crosshair path brightens as elsewhere.
+fn group_color(group: GroupColor, depth: usize, on_path: bool) -> Color {
+    let hue = match group {
+        GroupColor::Capitals => 188.0, // cyan/teal
+        GroupColor::Digits => 38.0,    // amber
+        GroupColor::Symbols => 315.0,  // magenta
+    };
+    let s = 0.68;
+    let mut l = if depth % 2 == 0 { 0.44 } else { 0.50 };
     if on_path {
         l += 0.07;
     }

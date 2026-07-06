@@ -27,6 +27,23 @@ fn oracle_reaches_m1_wpm_target() {
 }
 
 #[test]
+fn grouped_alphabet_keeps_wpm_on_lowercase() {
+    // The full (grouped) alphabet diverts only a sliver of mass into the
+    // capitals/digits/symbols group boxes, so lowercase throughput must stay
+    // at the M1 target — grouping is structure, not a speed tax (SPEC §5.4).
+    let alphabet = Alphabet::english_full();
+    let lm = PpmModel::seeded(&alphabet);
+    let mut e = Engine::new(alphabet, Box::new(lm), EngineParams::default());
+    e.set_viewport_px(800.0);
+    e.speed_bits = 6.0;
+    let target = "the weather today is quite nice and i would like to go for a walk in the park";
+    let r = run_oracle(&mut e, target, &OracleParams::default(), 42);
+    eprintln!("grouped oracle: wpm={:.1} chars={} secs={:.1}", r.wpm, r.chars, r.secs);
+    assert!(r.completed, "oracle did not finish on grouped alphabet: {r:?}");
+    assert!(r.wpm >= 15.0, "grouped alphabet must hold ≥ 15 WPM, got {:.1}", r.wpm);
+}
+
+#[test]
 fn oracle_handles_unseeded_text() {
     // Text with rare letters — checks the floor keeps everything reachable.
     let mut e = engine();

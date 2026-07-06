@@ -67,7 +67,9 @@ fn injection_worker(
 }
 
 fn main() -> Result<()> {
-    let alphabet = Alphabet::english_v1();
+    // The full alphabet groups capitals, digits, and symbols under expandable
+    // boxes (SPEC §5.4); its first 30 leaves match english_v1 exactly.
+    let alphabet = Alphabet::english_full();
     let lm = language_model(&alphabet);
 
     let chars: Vec<char> = (0..alphabet.len() as u8).map(|s| alphabet.char_of(s)).collect();

@@ -8,8 +8,16 @@
 //! relative to it, to keep f64 away from deep-zoom cancellation, and backward
 //! ("climb out") when the view escapes it — an exact reconstruction from the
 //! ledger, invisible on screen.
+//!
+//! The alphabet may be *grouped* (SPEC §5.4): rare runs (capitals, digits,
+//! symbols) sit inside expandable group boxes. A node therefore carries a
+//! `label` (the character it commits, or the group it opens) and an `opens`
+//! layout id naming the choices its children are drawn from. A group box adds
+//! an intermediate tree level on the path to a grouped leaf but leaves the
+//! final leaf's interval untouched — so ungrouped lowercase steering is
+//! bit-for-bit what it was before grouping existed.
 
-use crate::alphabet::Alphabet;
+use crate::alphabet::{Alphabet, GroupColor, Item};
 use crate::lm::LanguageModel;
 
 /// Per-frame steering input, already normalized by the front end.
@@ -41,6 +49,12 @@ pub struct EngineParams {
     pub commit_debounce: f64,
     /// Advance the frame once the view is narrower than this fraction of it.
     pub rebase_view_w: f64,
+    /// Advance the frame once the crosshair is contained this many tree levels
+    /// below the frame root, regardless of the view's absolute width. Keeps the
+    /// materialized tree shallow so a confident (peaked) model can't drive the
+    /// speculative frontier into the `max_depth` wall and strand the crosshair
+    /// in a box with no children ("no boxes shown"). Must be < `max_depth`.
+    pub soft_advance_depth: usize,
     /// Expansion depth limit below the current frame root (safety net; the
     /// pixel thresholds are the real gate).
     pub max_depth: usize,
@@ -63,6 +77,17 @@ pub struct EngineParams {
     /// stay uncommitted, so pausing mid-word never dumps tiny speculative
     /// descendants into the buffer.
     pub commit_release_frac: f64,
+    /// Auto speed control (SPEC §5.2): when true, `speed_bits` rises slowly
+    /// while steering is smooth and drops immediately on jitter or a zoom
+    /// reversal. Off by default so the oracle harness and unit tests drive
+    /// `speed_bits` directly; keyb-app turns it on from config.
+    pub adaptive_speed: bool,
+    /// Floor for the adaptive speed cap (also the novice starting point).
+    pub min_bits_per_sec: f64,
+    /// Multiplicative rise per second while steering smoothly forward.
+    pub speed_rise_per_sec: f64,
+    /// Fraction the cap is cut to on a detected reversal/jitter event.
+    pub speed_drop: f64,
 }
 
 impl Default for EngineParams {
@@ -74,11 +99,16 @@ impl Default for EngineParams {
             evict_px: 2.0,
             commit_debounce: 0.15,
             rebase_view_w: 1e-6,
+            soft_advance_depth: 16,
             max_depth: 64,
-            max_nodes: 4000,
+            max_nodes: 12000,
             upgrade_anim_secs: 0.12,
             retract_eps: 0.02,
             commit_release_frac: 0.5,
+            adaptive_speed: false,
+            min_bits_per_sec: 1.5,
+            speed_rise_per_sec: 0.35,
+            speed_drop: 0.6,
         }
     }
 }
@@ -94,8 +124,21 @@ pub enum TextEvent {
     Retract(String),
 }
 
+/// What a tree node is: a committed leaf character, or a group box that opens
+/// into its members. Group nodes add a level on the path to a grouped leaf but
+/// never enter the committed text.
+#[derive(Clone, Copy, Debug)]
+enum NodeLabel {
+    Char(u8),
+    Group(u32),
+}
+
 struct Node {
-    sym: u8,
+    label: NodeLabel,
+    /// Layout node id whose items this node's children are drawn from (a leaf
+    /// opens into the root layout — the next character; a group opens into
+    /// itself).
+    opens: u32,
     lo: f64,
     hi: f64,
     /// Depth below the current frame root (shifts when the frame moves).
@@ -111,21 +154,42 @@ struct Node {
     anim_target: Option<Box<[f64]>>,
 }
 
-/// One frame-absorbed symbol: the parent frame's complete child partition
-/// (`cuts[i]..cuts[i+1]` is child `i`) plus which child the frame descended
-/// into. Climbing back out re-lays the parent exactly as it was on screen,
-/// immune to LM drift.
+impl Node {
+    fn as_char(&self) -> Option<u8> {
+        match self.label {
+            NodeLabel::Char(s) => Some(s),
+            NodeLabel::Group(_) => None,
+        }
+    }
+    fn is_group(&self) -> bool {
+        matches!(self.label, NodeLabel::Group(_))
+    }
+}
+
+/// One frame-absorbed tree level: the parent's complete child partition
+/// (`cuts[i]..cuts[i+1]` is item `i`), the layout node the parent opened into
+/// (so the sibling labels can be rebuilt), which child the frame descended
+/// into, and whether that child was a leaf (i.e. consumed a committed
+/// character). Climbing back out re-lays the parent exactly as it was on
+/// screen, immune to LM drift.
 #[derive(Clone, Debug)]
 struct LedgerEntry {
     cuts: Box<[f64]>,
-    sym: u8,
+    opens: u32,
+    child_idx: usize,
+    was_char: bool,
 }
 
 /// A renderable box: vertical extent as fractions of the canvas (may exceed
 /// [0,1]; the renderer clips).
 #[derive(Clone, Copy, Debug)]
 pub struct BoxView {
+    /// Leaf symbol for a character box (unused for group boxes).
     pub sym: u8,
+    /// Glyph to draw for this box (character label, or the group's mark).
+    pub label: char,
+    /// Set for a group box; drives its distinct, popping color (SPEC §5.4).
+    pub group: Option<GroupColor>,
     /// Arena index of this node. Lets the renderer relate boxes to their
     /// children (via `parent`) without knowing the tree layout.
     pub id: usize,
@@ -149,15 +213,22 @@ pub struct Engine {
     nodes: Vec<Node>,
     view_lo: f64,
     view_hi: f64,
-    /// Full committed text. The first `ledger.len()` symbols are absorbed
-    /// into the frame; the rest (the "tail") are nodes in the tree.
+    /// Full committed text (leaf symbols). The first `frame_chars` are
+    /// absorbed into the frame; the rest (the "tail") are nodes in the tree.
     committed: Vec<u8>,
     ledger: Vec<LedgerEntry>,
+    /// Committed characters absorbed into the frame. Distinct from
+    /// `ledger.len()` (tree levels) because a grouped character is absorbed as
+    /// two levels (group box, then leaf).
+    frame_chars: usize,
     commit_candidate: Option<u8>, // symbol of first uncommitted contained node
     commit_timer: f64,
     outside_timer: f64,
     /// Engaged state of the previous `step`, to catch the release edge.
     was_engaged: bool,
+    /// Previous frame's selection point and zoom sign, for auto speed control.
+    prev_y: f64,
+    prev_dx_sign: i8,
     viewport_px: f64,
     /// Current speed cap in bits/s; UI may adjust, sim sets directly.
     pub speed_bits: f64,
@@ -184,7 +255,8 @@ fn copy_subtree(
     let n = &src[src_idx];
     let idx = dst.len();
     dst.push(Node {
-        sym: n.sym,
+        label: n.label,
+        opens: n.opens,
         lo: offset + n.lo * scale,
         hi: offset + n.hi * scale,
         depth,
@@ -207,40 +279,32 @@ fn copy_subtree(
     idx
 }
 
-/// A single fresh root node covering the whole frame [0, 1). The tree starts
-/// here, and `Engine::reset` returns to exactly this.
-fn root_node() -> Node {
-    Node {
-        sym: 0,
-        lo: 0.0,
-        hi: 1.0,
-        depth: 0,
-        parent: ROOT,
-        children: Vec::new(),
-        expanded: false,
-        alive: true,
-        anim_target: None,
-    }
-}
-
 impl Engine {
     pub fn new(alphabet: Alphabet, lm: Box<dyn LanguageModel>, params: EngineParams) -> Self {
         assert_eq!(lm.alphabet_len(), alphabet.len());
+        let root = alphabet.root_layout();
         Engine {
+            speed_bits: if params.adaptive_speed {
+                params.min_bits_per_sec
+            } else {
+                params.max_bits_per_sec
+            },
             alphabet,
             lm,
             params,
-            nodes: vec![root_node()],
+            nodes: vec![root_node(root)],
             view_lo: 0.0,
             view_hi: 1.0,
             committed: Vec::new(),
             ledger: Vec::new(),
+            frame_chars: 0,
             commit_candidate: None,
             commit_timer: 0.0,
             outside_timer: 0.0,
             was_engaged: false,
+            prev_y: 0.5,
+            prev_dx_sign: 0,
             viewport_px: 800.0,
-            speed_bits: params.max_bits_per_sec,
             events: Vec::new(),
         }
     }
@@ -256,15 +320,21 @@ impl Engine {
         while let Some(sym) = self.committed.pop() {
             self.lm.unlearn(&self.committed, sym);
         }
-        self.nodes = vec![root_node()];
+        self.nodes = vec![root_node(self.alphabet.root_layout())];
         self.view_lo = 0.0;
         self.view_hi = 1.0;
         self.ledger.clear();
+        self.frame_chars = 0;
         self.commit_candidate = None;
         self.commit_timer = 0.0;
         self.outside_timer = 0.0;
         self.was_engaged = false;
-        self.speed_bits = self.params.max_bits_per_sec;
+        self.prev_dx_sign = 0;
+        self.speed_bits = if self.params.adaptive_speed {
+            self.params.min_bits_per_sec
+        } else {
+            self.params.max_bits_per_sec
+        };
         self.events.clear();
     }
 
@@ -291,15 +361,19 @@ impl Engine {
     }
 
     fn tail_len(&self) -> usize {
-        self.committed.len() - self.ledger.len()
+        self.committed.len() - self.frame_chars
     }
 
     /// Advance the model by `dt` seconds under `input`.
     pub fn step(&mut self, input: PointerInput, dt: f64) {
         let dt = dt.clamp(0.0, 0.1);
         if input.engaged {
+            if self.params.adaptive_speed {
+                self.adapt_speed(input, dt);
+            }
             self.zoom(input, dt);
         }
+        self.prev_y = input.y;
         self.apply_upgrades();
         self.animate_partitions(dt);
         self.climb_out_if_outside();
@@ -316,50 +390,125 @@ impl Engine {
         self.was_engaged = input.engaged;
         self.update_commit(dt, input.engaged);
         self.advance_frame_if_deep();
+        // Advancing re-roots the frame; expand the freshly-exposed frontier now
+        // so the presented tree is never a frame behind (which would flash a
+        // childless box the user just zoomed into).
+        self.maintain_tree();
+    }
+
+    /// Auto speed control (SPEC §5.2): a port of Dasher's — reward smooth,
+    /// forward steering with slow multiplicative growth of the cap, and punish
+    /// jitter (a large lateral jump) or a zoom-direction reversal with an
+    /// immediate cut. The cap floats within `[min_bits, max_bits]`.
+    fn adapt_speed(&mut self, input: PointerInput, dt: f64) {
+        let dx_sign = if input.dx > 0.05 {
+            1
+        } else if input.dx < -0.05 {
+            -1
+        } else {
+            0
+        };
+        // Jitter proxy: lateral speed well above what smooth aiming needs.
+        let jitter = (input.y - self.prev_y).abs() > 0.25;
+        let reversed = self.prev_dx_sign != 0 && dx_sign != 0 && dx_sign != self.prev_dx_sign;
+        if jitter || reversed {
+            self.speed_bits = (self.speed_bits * self.params.speed_drop)
+                .max(self.params.min_bits_per_sec);
+        } else if dx_sign > 0 {
+            let grow = (1.0 + self.params.speed_rise_per_sec * dt).powf(1.0);
+            self.speed_bits = (self.speed_bits * grow).min(self.params.max_bits_per_sec);
+        }
+        if dx_sign != 0 {
+            self.prev_dx_sign = dx_sign;
+        }
     }
 
     /// Drain async LM upgrades (SPEC §6.3): a node expanded with fallback
     /// sizing gets a target partition to animate toward. Nodes that vanished
     /// (evicted, above the frame) are skipped — a re-expansion will hit the
-    /// LM's cache synchronously instead.
+    /// LM's cache synchronously instead. A single character context can size
+    /// several boxes: the character-position node *and* any expanded group
+    /// boxes beneath it (which partition the same distribution over their
+    /// members), so all of them are re-laid out.
     fn apply_upgrades(&mut self) {
         for (ctx, dist) in self.lm.poll_upgrades() {
             debug_assert_eq!(dist.len(), self.alphabet.len());
-            let Some(i) = self.node_for_context(&ctx) else { continue };
-            if !self.nodes[i].expanded || dist.len() != self.nodes[i].children.len() {
-                continue;
+            let Some(p) = self.node_for_context(&ctx) else { continue };
+            let mut stack = vec![p];
+            while let Some(n) = stack.pop() {
+                self.repartition_node(n, &dist);
+                for &c in &self.nodes[n].children.clone() {
+                    if self.nodes[c].alive && self.nodes[c].expanded && self.nodes[c].is_group() {
+                        stack.push(c);
+                    }
+                }
             }
-            let (lo, hi) = (self.nodes[i].lo, self.nodes[i].hi);
-            let w = hi - lo;
-            let mut cuts = Vec::with_capacity(dist.len() + 1);
-            let mut acc = lo;
-            cuts.push(lo);
-            for &p in &dist[..dist.len() - 1] {
-                acc += p * w;
-                cuts.push(acc);
-            }
-            cuts.push(hi);
-            self.nodes[i].anim_target = Some(cuts.into());
         }
     }
 
-    /// Walk `context` (absolute: document start) down from the frame root.
+    /// Set `node`'s animation target from a fresh leaf distribution, mapping it
+    /// through the node's layout so groups get their aggregate mass.
+    fn repartition_node(&mut self, i: usize, dist: &[f64]) {
+        if !self.nodes[i].alive || !self.nodes[i].expanded {
+            return;
+        }
+        let opens = self.nodes[i].opens;
+        let weights = self.alphabet.item_weights(opens, dist);
+        if weights.len() != self.nodes[i].children.len() {
+            return;
+        }
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 {
+            return;
+        }
+        let (lo, hi) = (self.nodes[i].lo, self.nodes[i].hi);
+        let w = hi - lo;
+        let mut cuts = Vec::with_capacity(weights.len() + 1);
+        let mut acc = lo;
+        cuts.push(lo);
+        for &wt in &weights[..weights.len() - 1] {
+            acc += wt / total * w;
+            cuts.push(acc);
+        }
+        cuts.push(hi);
+        self.nodes[i].anim_target = Some(cuts.into());
+    }
+
+    /// Walk `context` (absolute: document start) down from the frame root to
+    /// the character-position node it names (a leaf, or ROOT for the empty
+    /// relative context).
     fn node_for_context(&self, ctx: &[u8]) -> Option<usize> {
-        let prefix = &self.committed[..self.ledger.len()];
+        let prefix = &self.committed[..self.frame_chars];
         if !ctx.starts_with(prefix) {
             return None; // frame advanced past this context, or text retracted
         }
         let mut cur = ROOT;
-        for &s in &ctx[prefix.len()..] {
+        for &c in &ctx[prefix.len()..] {
+            cur = self.descend_one_char(cur, c)?;
+        }
+        Some(cur)
+    }
+
+    /// Descend from `start` through one character's worth of layout levels
+    /// (possibly a group box, then its member leaf), returning the leaf node.
+    /// `None` if any needed level isn't expanded/alive.
+    fn descend_one_char(&self, start: usize, c: u8) -> Option<usize> {
+        let mut cur = start;
+        loop {
             if !self.nodes[cur].expanded {
                 return None;
             }
-            cur = self.nodes[cur].children[s as usize];
-            if !self.nodes[cur].alive {
+            let opens = self.nodes[cur].opens;
+            let (k, is_leaf) = self.alphabet.item_leading_to(opens, c)?;
+            let child = *self.nodes[cur].children.get(k)?;
+            if !self.nodes[child].alive {
                 return None;
             }
+            cur = child;
+            if is_leaf {
+                return Some(cur);
+            }
         }
-        Some(cur)
     }
 
     /// Move animating partitions toward their targets (exponential approach,
@@ -479,13 +628,15 @@ impl Engine {
 
     fn climb_out_once(&mut self) {
         let e = self.ledger.pop().expect("caller checked non-empty");
-        let s = e.sym as usize;
-        let (c_lo, c_hi) = (e.cuts[s], e.cuts[s + 1]);
+        let opens = e.opens;
+        let items: Vec<Item> = self.alphabet.items(opens).to_vec();
+        let k = e.child_idx;
+        let (c_lo, c_hi) = (e.cuts[k], e.cuts[k + 1]);
         let cw = c_hi - c_lo;
-        let n_sym = self.alphabet.len();
-        let mut dst: Vec<Node> = Vec::with_capacity(self.nodes.len() + n_sym + 1);
+        let mut dst: Vec<Node> = Vec::with_capacity(self.nodes.len() + items.len() + 1);
         dst.push(Node {
-            sym: 0,
+            label: NodeLabel::Char(0),
+            opens,
             lo: 0.0,
             hi: 1.0,
             depth: 0,
@@ -495,18 +646,21 @@ impl Engine {
             alive: true,
             anim_target: None,
         });
-        let mut kids = Vec::with_capacity(n_sym);
-        for i in 0..n_sym {
-            if i == s {
+        let mut kids = Vec::with_capacity(items.len());
+        for (i, &item) in items.iter().enumerate() {
+            if i == k {
+                // Transplant the current tree into the descended slot; its root
+                // already carries the correct label/opens (copied on descent).
                 let idx = copy_subtree(&self.nodes, ROOT, &mut dst, ROOT, 1, c_lo, cw);
-                dst[idx].sym = e.sym;
                 dst[idx].lo = c_lo;
                 dst[idx].hi = c_hi;
                 kids.push(idx);
             } else {
+                let (label, c_opens) = label_and_opens(&self.alphabet, item);
                 let idx = dst.len();
                 dst.push(Node {
-                    sym: i as u8,
+                    label,
+                    opens: c_opens,
                     lo: e.cuts[i],
                     hi: e.cuts[i + 1],
                     depth: 1,
@@ -523,13 +677,27 @@ impl Engine {
         self.nodes = dst;
         self.view_lo = c_lo + self.view_lo * cw;
         self.view_hi = c_lo + self.view_hi * cw;
+        if e.was_char {
+            self.frame_chars -= 1;
+        }
     }
 
-    /// Deep-zoom rebase (forward): once the view is tiny relative to the
-    /// frame, descend the root into committed children. Pure re-anchoring —
-    /// the ledger records each level's exact partition for the way back.
+    /// Forward frame advance: descend the root into the child the view has
+    /// zoomed inside, re-anchoring coordinates in place (pure — the ledger
+    /// records each level's exact partition for the way back). Triggered two
+    /// ways: when the view is tiny relative to the frame (f64 precision), or
+    /// when the crosshair is contained many levels deep (`soft_advance_depth`)
+    /// so a confident model can't drive the frontier into the `max_depth`
+    /// wall. A grouped character is absorbed as two levels (group box, then
+    /// leaf).
     fn advance_frame_if_deep(&mut self) {
-        while self.view_hi - self.view_lo < self.params.rebase_view_w && self.tail_len() > 0 {
+        loop {
+            let deep_view = self.view_hi - self.view_lo < self.params.rebase_view_w;
+            let contained = self.contained_path();
+            let deep_tree = contained.len() >= self.params.soft_advance_depth;
+            if !(deep_view || deep_tree) {
+                return;
+            }
             if !self.advance_frame_once() {
                 return;
             }
@@ -540,13 +708,42 @@ impl Engine {
         if !self.nodes[ROOT].expanded {
             return false;
         }
-        let sym = self.committed[self.ledger.len()];
-        let child = self.nodes[ROOT].children[sym as usize];
+        // The shallowest root child the whole view sits inside.
+        let opens = self.nodes[ROOT].opens;
+        let Some((k, &child)) = self
+            .nodes[ROOT]
+            .children
+            .iter()
+            .enumerate()
+            .find(|(_, &c)| {
+                let n = &self.nodes[c];
+                n.alive && n.lo <= self.view_lo && self.view_hi <= n.hi
+            })
+        else {
+            return false; // view straddles a boundary; nothing to descend into
+        };
         let (c_lo, c_hi) = (self.nodes[child].lo, self.nodes[child].hi);
-        // Only advance into a child that holds the view (mid-retraction the
-        // committed child may not; climbing right back out would be churn).
-        if !(c_lo <= self.view_lo && self.view_hi <= c_hi) {
-            return false;
+        let is_leaf = self.nodes[child].as_char().is_some();
+        if let Some(sym) = self.nodes[child].as_char() {
+            if self.frame_chars < self.committed.len() {
+                // Mid-retraction the view may still sit in the last committed
+                // child while off the newer path; only absorb the committed
+                // char, never a divergent one.
+                if self.committed[self.frame_chars] != sym {
+                    return false;
+                }
+            } else {
+                // The view has zoomed entirely inside a not-yet-committed leaf
+                // (fast steering outran the containment debounce). Commit it
+                // now so the frame can advance and depth stays bounded; a
+                // back-zoom still retracts it through the ledger.
+                self.lm.learn(&self.committed, sym);
+                self.committed.push(sym);
+                self.events
+                    .push(TextEvent::Commit(self.alphabet.char_of(sym).to_string()));
+                self.commit_candidate = None;
+                self.commit_timer = 0.0;
+            }
         }
         let mut cuts: Vec<f64> = self.nodes[ROOT]
             .children
@@ -554,7 +751,12 @@ impl Engine {
             .map(|&i| self.nodes[i].lo)
             .collect();
         cuts.push(1.0);
-        self.ledger.push(LedgerEntry { cuts: cuts.into(), sym });
+        self.ledger.push(LedgerEntry {
+            cuts: cuts.into(),
+            opens,
+            child_idx: k,
+            was_char: is_leaf,
+        });
         let scale = 1.0 / (c_hi - c_lo);
         let offset = -c_lo * scale;
         let mut dst = Vec::with_capacity(self.nodes.len());
@@ -564,6 +766,9 @@ impl Engine {
         self.nodes = dst;
         self.view_lo = offset + self.view_lo * scale;
         self.view_hi = offset + self.view_hi * scale;
+        if is_leaf {
+            self.frame_chars += 1;
+        }
         true
     }
 
@@ -574,6 +779,12 @@ impl Engine {
             self.compact();
         }
         let w = self.view_hi - self.view_lo;
+        // No point materializing deeper than where the frame will advance:
+        // once the crosshair is `soft_advance_depth` in, the root descends and
+        // depth resets, so a small lookahead beyond it is all that's ever
+        // seen. Keeping the frontier here (well under `max_depth`) means the
+        // depth wall can never strand a *reachable* box without children.
+        let expand_cap = (self.params.soft_advance_depth + 8).min(self.params.max_depth);
         let mut stack = vec![ROOT];
         while let Some(i) = stack.pop() {
             let n = &self.nodes[i];
@@ -591,7 +802,7 @@ impl Engine {
                 }
             } else if visible
                 && h_px > self.params.expand_px
-                && depth < self.params.max_depth
+                && depth < expand_cap
                 && self.nodes.len() < self.params.max_nodes
             {
                 self.expand(i);
@@ -608,24 +819,29 @@ impl Engine {
     }
 
     fn expand(&mut self, i: usize) {
-        let (lo, hi, depth) = {
+        let (lo, hi, depth, opens) = {
             let n = &self.nodes[i];
-            (n.lo, n.hi, n.depth)
+            (n.lo, n.hi, n.depth, n.opens)
         };
         let ctx = self.context_of(i);
         let dist = self.lm.predict(&ctx);
         debug_assert_eq!(dist.len(), self.alphabet.len());
+        let items: Vec<Item> = self.alphabet.items(opens).to_vec();
+        let weights = self.alphabet.item_weights(opens, &dist);
+        let total: f64 = weights.iter().sum::<f64>().max(f64::MIN_POSITIVE);
         let w = hi - lo;
         let mut cursor = lo;
-        let mut children = Vec::with_capacity(dist.len());
-        for (sym, &p) in dist.iter().enumerate() {
+        let mut children = Vec::with_capacity(items.len());
+        for (k, &item) in items.iter().enumerate() {
             let c_lo = cursor;
             // Last child absorbs rounding so children exactly partition [lo,hi).
-            let c_hi = if sym + 1 == dist.len() { hi } else { cursor + p * w };
+            let c_hi = if k + 1 == items.len() { hi } else { cursor + weights[k] / total * w };
             cursor = c_hi;
+            let (label, c_opens) = label_and_opens(&self.alphabet, item);
             children.push(self.nodes.len());
             self.nodes.push(Node {
-                sym: sym as u8,
+                label,
+                opens: c_opens,
                 lo: c_lo,
                 hi: c_hi,
                 depth: depth + 1,
@@ -665,20 +881,24 @@ impl Engine {
         }
     }
 
-    /// Frame-absorbed text plus path symbols from frame root to node `i`.
+    /// Frame-absorbed text plus the leaf characters from frame root to node
+    /// `i` (group boxes on the path contribute no character).
     fn context_of(&self, i: usize) -> Vec<u8> {
         let mut path = Vec::new();
         let mut cur = i;
         while cur != ROOT {
-            path.push(self.nodes[cur].sym);
+            if let Some(s) = self.nodes[cur].as_char() {
+                path.push(s);
+            }
             cur = self.nodes[cur].parent;
         }
-        let mut ctx = self.committed[..self.ledger.len()].to_vec();
+        let mut ctx = self.committed[..self.frame_chars].to_vec();
         ctx.extend(path.iter().rev());
         ctx
     }
 
-    /// Chain of nodes (root-child first) that fully contain the view.
+    /// Chain of nodes (root-child first) that fully contain the view, including
+    /// group boxes.
     fn contained_path(&self) -> Vec<usize> {
         let mut out = Vec::new();
         let mut cur = ROOT;
@@ -697,7 +917,7 @@ impl Engine {
     }
 
     /// Chain of nodes containing the view center — the crosshair path: what
-    /// will be written if the user keeps steering here.
+    /// will be written if the user keeps steering here (group boxes included).
     fn center_path(&self) -> Vec<usize> {
         let c = (self.view_lo + self.view_hi) / 2.0;
         let mut out = Vec::new();
@@ -716,17 +936,17 @@ impl Engine {
         out
     }
 
-    /// Uncommitted symbols under the crosshair, for the ribbon preview.
+    /// Leaf-character symbols under the crosshair, for the ribbon preview.
     /// Empty while the crosshair path disagrees with the committed tail
     /// (i.e. mid-retraction).
     pub fn pending_syms(&self) -> Vec<u8> {
-        let tail = &self.committed[self.ledger.len()..];
-        let path = self.center_path();
-        if path.len() < tail.len() {
-            return Vec::new();
-        }
-        let syms: Vec<u8> = path.iter().map(|&i| self.nodes[i].sym).collect();
-        if !syms.starts_with(tail) {
+        let tail = &self.committed[self.frame_chars..];
+        let syms: Vec<u8> = self
+            .center_path()
+            .iter()
+            .filter_map(|&i| self.nodes[i].as_char())
+            .collect();
+        if syms.len() < tail.len() || !syms.starts_with(tail) {
             return Vec::new();
         }
         syms[tail.len()..].to_vec()
@@ -741,11 +961,11 @@ impl Engine {
     fn committed_node_holds_view(&self) -> bool {
         let eps = self.params.retract_eps * (self.view_hi - self.view_lo);
         let mut cur = ROOT;
-        for &s in &self.committed[self.ledger.len()..] {
-            if !self.nodes[cur].expanded {
-                return false;
+        for &s in &self.committed[self.frame_chars..] {
+            match self.descend_one_char(cur, s) {
+                Some(x) => cur = x,
+                None => return false,
             }
-            cur = self.nodes[cur].children[s as usize];
         }
         let n = &self.nodes[cur];
         n.lo - eps <= self.view_lo && self.view_hi <= n.hi + eps
@@ -756,16 +976,22 @@ impl Engine {
     /// stay outside the deepest committed node for the same period to retract
     /// one symbol. Geometry never changes here — only the buffer and the LM.
     fn update_commit(&mut self, dt: f64, engaged: bool) {
-        let chain = self.contained_path();
+        let contained = self.contained_path();
+        // Only leaf characters commit; group boxes on the path are transparent.
+        let chars: Vec<usize> = contained
+            .iter()
+            .copied()
+            .filter(|&i| self.nodes[i].as_char().is_some())
+            .collect();
         let tail = self.tail_len();
-        let on_track = chain.len() >= tail
-            && chain[..tail]
+        let on_track = chars.len() >= tail
+            && chars[..tail]
                 .iter()
-                .map(|&i| self.nodes[i].sym)
-                .eq(self.committed[self.ledger.len()..].iter().copied());
-        if on_track && chain.len() > tail {
+                .map(|&i| self.nodes[i].as_char().expect("filtered to chars"))
+                .eq(self.committed[self.frame_chars..].iter().copied());
+        if on_track && chars.len() > tail {
             self.outside_timer = 0.0;
-            let cand = self.nodes[chain[tail]].sym;
+            let cand = self.nodes[chars[tail]].as_char().expect("char");
             if self.commit_candidate != Some(cand) {
                 self.commit_candidate = Some(cand);
                 self.commit_timer = 0.0;
@@ -780,8 +1006,8 @@ impl Engine {
             // Commit the whole contained chain — deeper containment implies
             // the first link was contained throughout the debounce.
             let mut text = String::new();
-            for &id in &chain[tail..] {
-                let sym = self.nodes[id].sym;
+            for &id in &chars[tail..] {
+                let sym = self.nodes[id].as_char().expect("char");
                 self.lm.learn(&self.committed, sym);
                 self.committed.push(sym);
                 text.push(self.alphabet.char_of(sym));
@@ -814,7 +1040,7 @@ impl Engine {
         }
     }
 
-    /// On release, commit the crosshair-path boxes that dominate the view
+    /// On release, commit the crosshair-path characters that dominate the view
     /// (height ≥ `commit_release_frac`), ahead of the containment debounce, so
     /// letting go lands the letter you were steering at. Geometry is untouched,
     /// exactly like a debounced commit — only the watermark and the LM move.
@@ -822,23 +1048,28 @@ impl Engine {
     /// (mid-retraction) or nothing yet dominates.
     fn commit_under_crosshair(&mut self) {
         let w = self.view_hi - self.view_lo;
-        let path = self.center_path();
+        let chars: Vec<usize> = self
+            .center_path()
+            .iter()
+            .copied()
+            .filter(|&i| self.nodes[i].as_char().is_some())
+            .collect();
         let tail = self.tail_len();
-        if path.len() <= tail {
+        if chars.len() <= tail {
             return;
         }
-        let on_track = path[..tail]
+        let on_track = chars[..tail]
             .iter()
-            .map(|&i| self.nodes[i].sym)
-            .eq(self.committed[self.ledger.len()..].iter().copied());
+            .map(|&i| self.nodes[i].as_char().expect("char"))
+            .eq(self.committed[self.frame_chars..].iter().copied());
         if !on_track {
             return;
         }
         let mut text = String::new();
-        for &id in &path[tail..] {
+        for &id in &chars[tail..] {
             let (lo, hi, sym) = {
                 let n = &self.nodes[id];
-                (n.lo, n.hi, n.sym)
+                (n.lo, n.hi, n.as_char().expect("char"))
             };
             if hi - lo < self.params.commit_release_frac * w {
                 break; // deeper boxes are smaller still; stop at the first misfit
@@ -855,34 +1086,56 @@ impl Engine {
     }
 
     /// Interval, in current-frame coordinates, of a continuation `next`
-    /// beyond the committed text. Follows actual tree geometry where nodes
-    /// exist (the LM may have learned since a node was laid out) and extends
-    /// with fresh LM predictions below the tree. Used by the oracle sim.
+    /// (leaf characters) beyond the committed text. Follows actual tree
+    /// geometry where nodes exist (the LM may have learned since a node was
+    /// laid out) and extends with fresh LM predictions below the tree,
+    /// descending through group boxes as needed. Used by the oracle sim.
     pub fn path_interval(&mut self, next: &[u8]) -> (f64, f64) {
-        let mut syms: Vec<u8> = self.committed[self.ledger.len()..].to_vec();
+        let mut syms: Vec<u8> = self.committed[self.frame_chars..].to_vec();
         syms.extend_from_slice(next);
-        let mut ctx: Vec<u8> = self.committed[..self.ledger.len()].to_vec();
+        let mut ctx: Vec<u8> = self.committed[..self.frame_chars].to_vec();
         let (mut lo, mut hi) = (0.0f64, 1.0f64);
         let mut node = Some(ROOT);
-        for &s in &syms {
-            match node {
-                Some(i) if self.nodes[i].expanded => {
-                    let c = self.nodes[i].children[s as usize];
-                    lo = self.nodes[c].lo;
-                    hi = self.nodes[c].hi;
-                    node = Some(c);
+        let mut opens = self.nodes[ROOT].opens;
+        for &c in &syms {
+            // One character = descend the layout from `opens` down to its leaf,
+            // possibly crossing a group level.
+            loop {
+                // The frame can be rooted inside a group box (the view zoomed
+                // into it); a non-member character then isn't reachable without
+                // first backing out. Report the whole current interval so the
+                // oracle steers outward rather than the helper panicking.
+                let Some((k, is_leaf)) = self.alphabet.item_leading_to(opens, c) else {
+                    return (lo, hi);
+                };
+                match node {
+                    Some(i) if self.nodes[i].expanded => {
+                        let ch = self.nodes[i].children[k];
+                        lo = self.nodes[ch].lo;
+                        hi = self.nodes[ch].hi;
+                        node = Some(ch);
+                        opens = self.nodes[ch].opens;
+                    }
+                    _ => {
+                        node = None;
+                        let dist = self.lm.predict(&ctx);
+                        let weights = self.alphabet.item_weights(opens, &dist);
+                        let total: f64 = weights.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+                        let before: f64 = weights[..k].iter().sum();
+                        let w = hi - lo;
+                        let n_lo = lo + w * before / total;
+                        hi = n_lo + w * weights[k] / total;
+                        lo = n_lo;
+                        opens = self.alphabet.opens_of(self.alphabet.items(opens)[k]);
+                    }
                 }
-                _ => {
-                    node = None;
-                    let dist = self.lm.predict(&ctx);
-                    let w = hi - lo;
-                    let before: f64 = dist[..s as usize].iter().sum();
-                    let n_lo = lo + w * before;
-                    hi = n_lo + w * dist[s as usize];
-                    lo = n_lo;
+                if is_leaf {
+                    break;
                 }
             }
-            ctx.push(s);
+            ctx.push(c);
+            // Next character always starts from the root layout.
+            opens = self.alphabet.root_layout();
         }
         (lo, hi)
     }
@@ -898,18 +1151,53 @@ impl Engine {
             .enumerate()
             .skip(1)
             .filter(|(_, n)| n.alive && n.hi > self.view_lo && n.lo < self.view_hi)
-            .map(|(i, n)| BoxView {
-                sym: n.sym,
-                id: i,
-                parent: n.parent,
-                depth: frame_depth + n.depth,
-                y0: (n.lo - self.view_lo) / w,
-                y1: (n.hi - self.view_lo) / w,
-                on_path: path.contains(&i),
+            .map(|(i, n)| {
+                let (sym, label, group) = match n.label {
+                    NodeLabel::Char(s) => (s, self.alphabet.label(s), None),
+                    NodeLabel::Group(g) => {
+                        (0, self.alphabet.group_label(g), Some(self.alphabet.group_color(g)))
+                    }
+                };
+                BoxView {
+                    sym,
+                    label,
+                    group,
+                    id: i,
+                    parent: n.parent,
+                    depth: frame_depth + n.depth,
+                    y0: (n.lo - self.view_lo) / w,
+                    y1: (n.hi - self.view_lo) / w,
+                    on_path: path.contains(&i),
+                }
             })
             .collect();
         out.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.y0.total_cmp(&b.y0)));
         out
+    }
+}
+
+/// A single fresh root node covering the whole frame [0, 1), opening into the
+/// root layout. The tree starts here, and `Engine::reset` returns to this.
+fn root_node(root_layout: u32) -> Node {
+    Node {
+        label: NodeLabel::Char(0),
+        opens: root_layout,
+        lo: 0.0,
+        hi: 1.0,
+        depth: 0,
+        parent: ROOT,
+        children: Vec::new(),
+        expanded: false,
+        alive: true,
+        anim_target: None,
+    }
+}
+
+/// A child node's label and the layout it opens into, for a layout item.
+fn label_and_opens(alphabet: &Alphabet, item: Item) -> (NodeLabel, u32) {
+    match item {
+        Item::Leaf(s) => (NodeLabel::Char(s), alphabet.root_layout()),
+        Item::Group(g) => (NodeLabel::Group(g), g),
     }
 }
 
@@ -1169,7 +1457,7 @@ mod tests {
             // (so the containment debounce hasn't fired)?
             let dominant = e.center_path().first().is_some_and(|&i| {
                 let n = &e.nodes[i];
-                n.sym == 0
+                n.as_char() == Some(0)
                     && n.hi - n.lo >= e.params.commit_release_frac * w
                     && !(n.lo <= v_lo && n.hi >= v_hi)
             });
@@ -1271,6 +1559,7 @@ mod tests {
 
         assert!(e.committed_syms().is_empty(), "committed buffer cleared");
         assert!(e.ledger.is_empty(), "ledger cleared");
+        assert_eq!(e.frame_chars, 0, "frame char count cleared");
         assert_eq!(e.view(), (0.0, 1.0), "view back at the root frame");
         assert_eq!(e.nodes.len(), 1, "tree back to a single root");
         assert_eq!(e.speed_bits, e.params.max_bits_per_sec, "speed restored");
@@ -1280,4 +1569,196 @@ mod tests {
             "reset must unlearn every commit, leaving the LM at baseline"
         );
     }
+
+    fn full_engine() -> Engine {
+        let a = Alphabet::english_full();
+        let n = a.len();
+        Engine::new(a, Box::new(UniformModel(n)), EngineParams::default())
+    }
+
+    /// Sharply peaked deterministic Markov chain over the lowercase letters:
+    /// the argmax next letter is a fixed function of the previous one, so the
+    /// dominant boxes form one long followable chain — a "hold zoom into the
+    /// biggest box" path the oracle never drives, and the worst case for
+    /// runaway speculative depth.
+    struct PeakedModel {
+        n: usize,
+    }
+    impl PeakedModel {
+        fn next_letter(prev: u8) -> u8 {
+            (prev.wrapping_mul(7).wrapping_add(3)) % 26
+        }
+    }
+    impl LanguageModel for PeakedModel {
+        fn predict(&mut self, context: &[u8]) -> Vec<f64> {
+            let n = self.n;
+            let mut p = vec![0.01 / n as f64; n];
+            let prev = context.last().copied().unwrap_or(3);
+            p[Self::next_letter(prev) as usize] = 0.99;
+            let s: f64 = p.iter().sum();
+            for v in p.iter_mut() {
+                *v /= s;
+            }
+            p
+        }
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    /// A human who zooms straight into the dominant box must never end up
+    /// *inside* a box with no expandable children ("no boxes shown, typing
+    /// impossible"). Uses a degenerately-confident model so the speculative
+    /// frontier is driven as hard as possible; the box the crosshair is
+    /// actually contained in must always be able to reveal its next level.
+    #[test]
+    fn deep_zoom_into_peaked_chain_never_wedges() {
+        let a = Alphabet::english_full();
+        let n = a.len();
+        let mut e = Engine::new(a, Box::new(PeakedModel { n }), EngineParams::default());
+        e.set_viewport_px(900.0);
+        e.speed_bits = 6.0;
+        let mut max_depth = 0usize;
+        let mut max_nodes = 0usize;
+        let mut wrote = 0usize;
+        for frame in 0..6000 {
+            let committed = e.committed_syms().to_vec();
+            wrote = wrote.max(committed.len());
+            let prev = committed.last().copied().unwrap_or(3);
+            let arg = PeakedModel::next_letter(prev);
+            let (lo, hi) = e.path_interval(&[arg]);
+            let (v_lo, v_hi) = e.view();
+            let y = ((lo + hi) / 2.0 - v_lo) / (v_hi - v_lo);
+            e.step(PointerInput { dx: 1.0, y: y.clamp(0.0, 1.0), engaged: true }, 1.0 / 60.0);
+            max_depth =
+                max_depth.max(e.nodes.iter().filter(|x| x.alive).map(|x| x.depth).max().unwrap_or(0));
+            max_nodes = max_nodes.max(e.nodes.len());
+            // The deepest box that fully contains the view is the one the user
+            // is inside. Once it dominates the view it must be expanded with
+            // live children, or there is nowhere to steer next.
+            let (v_lo, v_hi) = e.view();
+            if let Some(&deep) = e.contained_path().last() {
+                let node = &e.nodes[deep];
+                let h_px = (node.hi - node.lo) / (v_hi - v_lo) * 900.0;
+                let dominates = h_px > 3.0 * e.params.expand_px;
+                let childless = !node.expanded || node.children.iter().all(|&c| !e.nodes[c].alive);
+                if dominates && childless {
+                    panic!(
+                        "wedged at frame {frame}: contained box depth={} h_px={:.0} has no \
+                         children (committed len={}, max_depth={max_depth}, max_nodes={max_nodes})",
+                        node.depth,
+                        h_px,
+                        e.committed_syms().len()
+                    );
+                }
+            }
+        }
+        // And it must actually make progress, not just avoid wedging.
+        assert!(wrote > 20, "should have written many chars, only {wrote}");
+        eprintln!("no wedge: wrote={wrote} max_depth={max_depth} max_nodes={max_nodes}");
+    }
+
+    #[test]
+    fn types_the_man_through_capitals() {
+        let mut e = full_engine();
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        let target = e.alphabet.encode("The man");
+        eprintln!("target syms = {target:?}");
+        let ok = steer_to(&mut e, &target, 30000);
+        eprintln!("committed = {:?}", e.committed_text());
+        assert!(ok, "should type 'The man', got {:?}", e.committed_text());
+    }
+
+    #[test]
+    fn types_capital_phrase_with_forced_frame_advance() {
+        let mut e = full_engine();
+        // Advance the frame after nearly every commit so group-level ledger
+        // absorption and climb-out are exercised hard on a capital path.
+        e.params.rebase_view_w = 0.5;
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        let target = e.alphabet.encode("The man");
+        let ok = steer_to(&mut e, &target, 40000);
+        eprintln!("committed = {:?} ledger={}", e.committed_text(), e.ledger.len());
+        assert!(ok, "should type 'The man' under forced rebase, got {:?}", e.committed_text());
+    }
+
+    /// A grouped character ('A', inside the capitals group) is reachable and
+    /// commits the right leaf, exercising the group-box tree level.
+    #[test]
+    fn writes_a_grouped_capital() {
+        let mut e = full_engine();
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        let cap_a = e.alphabet.index_of('A').unwrap();
+        assert!(steer_to(&mut e, &[cap_a], 4000), "should commit 'A'");
+        assert_eq!(e.committed_text(), "A");
+    }
+
+    /// Grouping must not disturb leaf geometry: a lowercase target writes the
+    /// same on the grouped alphabet as on the flat one (identical LM), and
+    /// round-trips through frame advance/climb exactly.
+    #[test]
+    fn grouped_alphabet_roundtrips_lowercase() {
+        let mut e = full_engine();
+        e.params.rebase_view_w = 0.5;
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        let target = e.alphabet.encode("cab");
+        assert!(steer_to(&mut e, &target, 5000), "should write 'cab'");
+        assert!(!e.ledger.is_empty(), "frame should have advanced");
+        for _ in 0..5000 {
+            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            if e.committed_syms().is_empty() && e.ledger.is_empty() {
+                break;
+            }
+        }
+        assert!(e.committed_syms().is_empty(), "full retraction");
+        assert!(e.ledger.is_empty(), "frame back at document root");
+        assert_eq!(e.frame_chars, 0);
+    }
+
+    /// The visible set marks group boxes with a color and their label, and
+    /// leaves as plain characters.
+    #[test]
+    fn visible_marks_group_boxes() {
+        let mut e = full_engine();
+        e.set_viewport_px(1000.0);
+        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        let boxes = e.visible();
+        assert!(
+            boxes.iter().any(|b| b.group == Some(GroupColor::Capitals)),
+            "a capitals group box must be visible at the top level"
+        );
+        assert!(
+            boxes.iter().any(|b| b.group.is_none() && b.label == 'a'),
+            "plain letter boxes must still be present"
+        );
+    }
+
+    /// Adaptive speed rises under smooth forward steering and is cut by a
+    /// zoom reversal.
+    #[test]
+    fn adaptive_speed_rises_and_drops() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let mut p = EngineParams { adaptive_speed: true, ..EngineParams::default() };
+        p.min_bits_per_sec = 1.5;
+        p.max_bits_per_sec = 8.0;
+        let mut e = Engine::new(a, Box::new(UniformModel(n)), p);
+        e.set_viewport_px(1000.0);
+        let start = e.speed_bits;
+        for _ in 0..300 {
+            e.step(PointerInput { dx: 1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+        }
+        let risen = e.speed_bits;
+        assert!(risen > start + 0.5, "smooth steering must raise the cap: {start} -> {risen}");
+        // A hard reversal cuts it immediately.
+        e.step(PointerInput { dx: 1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+        e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+        assert!(e.speed_bits < risen, "a reversal must cut the cap: {risen} -> {}", e.speed_bits);
+        assert!(e.speed_bits >= e.params.min_bits_per_sec);
+    }
 }
+

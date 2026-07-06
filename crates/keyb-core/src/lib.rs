@@ -8,6 +8,6 @@ pub mod engine;
 pub mod lm;
 pub mod sim;
 
-pub use alphabet::Alphabet;
+pub use alphabet::{Alphabet, GroupColor};
 pub use engine::{BoxView, Engine, EngineParams, PointerInput, TextEvent};
 pub use lm::LanguageModel;
