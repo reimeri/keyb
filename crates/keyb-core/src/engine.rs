@@ -117,6 +117,12 @@ struct LedgerEntry {
 #[derive(Clone, Copy, Debug)]
 pub struct BoxView {
     pub sym: u8,
+    /// Arena index of this node. Lets the renderer relate boxes to their
+    /// children (via `parent`) without knowing the tree layout.
+    pub id: usize,
+    /// Arena index of this node's parent. A parent not present in the visible
+    /// set (ROOT or culled) is harmlessly ignored by the renderer.
+    pub parent: usize,
     /// Absolute depth from the document root (stable across frame moves, so
     /// palette parity never flips on screen).
     pub depth: usize,
@@ -804,6 +810,8 @@ impl Engine {
             .filter(|(_, n)| n.alive && n.hi > self.view_lo && n.lo < self.view_hi)
             .map(|(i, n)| BoxView {
                 sym: n.sym,
+                id: i,
+                parent: n.parent,
                 depth: frame_depth + n.depth,
                 y0: (n.lo - self.view_lo) / w,
                 y1: (n.hi - self.view_lo) / w,
