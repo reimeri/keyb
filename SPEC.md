@@ -286,12 +286,17 @@ safe at 60 Hz).
 
 ### 7.3 Window behavior
 
-- Wayland: **wlr-layer-shell** surface (overlay layer, anchored/user-positioned),
-  `keyboard_interactivity: none` — the window can *never* steal keyboard focus.
-- X11: override-redirect window with `_NET_WM_WINDOW_TYPE_DOCK` +
-  no-input-focus hints (`WM_HINTS.input = False`).
+- Wayland: **wlr-layer-shell** surface (overlay layer, bottom-anchored strip,
+  exclusive zone so targets shift up), `keyboard_interactivity: none` — the
+  window can *never* steal keyboard focus. M3: winit has no layer-shell, so
+  this frontend speaks smithay-client-toolkit directly and bridges the raw
+  `wl_surface` into wgpu; `KEYB_SHELL`/`KEYB_HEIGHT` override frontend/size.
+- X11: winit window with override-redirect + `_NET_WM_WINDOW_TYPE_DOCK`
+  (unmanaged ⇒ the WM never focuses it).
 - The pointer is *captured* while steering is engaged (button held): pointer-lock
   (relative motion) so the cursor can't wander off the OSK window mid-word.
+  M3: deferred to M4 — for now a pointer that leaves the strip disengages
+  steering (fail-safe against a stuck drag).
 
 ### 7.4 Settings
 
@@ -304,30 +309,53 @@ Never visible during typing.
 ```rust
 trait Injector: Send {
     fn commit(&mut self, text: &str) -> Result<()>;
-    fn retract(&mut self, chars: usize) -> Result<()>;  // undo support
-    fn capabilities(&self) -> Caps;                     // true retraction? surrounding text?
+    /// Remove exactly `text` from the end of what was committed. (M3: the
+    /// text rather than a count — IM deletion needs byte lengths, key
+    /// synthesis needs char counts.)
+    fn retract(&mut self, text: &str) -> Result<()>;
+    fn capabilities(&self) -> Caps;                     // true retraction?
 }
 ```
 
-Backends, auto-detected in order:
+Backends, auto-detected in order (`KEYB_INJECT` forces one):
 
 1. **Wayland `zwp_input_method_v2`** (preferred where the compositor allows it):
-   real preedit + commit + `delete_surrounding_text` → true retraction.
-2. **Wayland `zwp_virtual_keyboard_v1`**: synthesizes key events from a dynamic
-   keymap; retraction = synthesized backspaces.
-3. **X11 XTEST**: synthesized key events; retraction = backspaces.
+   real commit + `delete_surrounding_text` → true retraction.
+2. **Wayland `zwp_virtual_keyboard_v1`**: synthesizes key events from a
+   generated keymap in which every alphabet symbol owns a keycode
+   (layout-independent); retraction = synthesized backspaces.
+3. **X11 XTEST**: synthesized key events, keycodes resolved from the user's
+   live layout at runtime (verified against a Colemak host); retraction =
+   backspaces.
 4. **Clipboard-assist fallback**: types via paste; last resort, off by default.
+
+M3 findings (from the foot-under-headless-sway harness, §11):
+
+- Backends 1 and 2 are **one hybrid injector on one connection**, choosing
+  *per operation*: IM activation tracks the focused window, so "which backend"
+  is not a startup decision. Commits ride the IM whenever the focused field
+  activated us, key synthesis otherwise.
+- `delete_surrounding_text` is only trustworthy when the target has sent
+  `surrounding_text` (terminals never do — they silently drop deletions), so
+  retraction falls back to BackSpace synthesis even while the IM is active
+  unless surrounding text was seen.
+- Targets need ~60 ms after activating the IM before their first commit
+  reliably lands (foot drops a commit that races its IME setup); the injector
+  enforces that settle delay. Irrelevant during interactive steering.
 
 ### 8.3 Commit semantics
 
 - Text is committed when its node's interval fully contains the view frame
   (i.e., the user has zoomed entirely inside it) **and** has stayed contained
   for 150 ms (debounce against overshoot).
-- A rolling **retraction ledger** of the last 32 commits is kept; backward zoom
-  across a commit boundary pops the ledger and calls `retract()`. Injectors
-  without true retraction use backspace synthesis; if capabilities report
-  unreliable retraction (e.g., target app unknown), the UI requires a deeper
-  back-zoom (hysteresis) before retracting, to avoid mangling text.
+- A rolling **retraction ledger** of the last 32 commits is kept (in the
+  injection worker, keyb-app side); backward zoom across a commit boundary
+  pops the ledger and calls `retract()`. Retraction beyond what the ledger
+  tracks is refused — the engine still retracts internally, but stale text in
+  the target is left standing rather than guessed at. Injectors without true
+  retraction use backspace synthesis; when capabilities report unreliable
+  retraction the engine's hysteresis is widened (`retract_eps` 0.02 → 0.10)
+  so retracting takes a firmer back-zoom.
 
 ## 9. Configuration & persistence
 

@@ -1,47 +1,77 @@
-//! keyb-ui: winit window + vello scene for the zooming canvas (SPEC §7).
+//! keyb-ui: the zooming canvas (SPEC §7).
+//!
+//! Two window frontends share one frame core:
+//! - `layer_shell`: Wayland wlr-layer-shell overlay that can never take
+//!   keyboard focus (SPEC §7.3) — the OSK proper.
+//! - `winit_shell`: X11 override-redirect/dock OSK, and a plain window for
+//!   development.
+//!
+//! Committed-text changes are forwarded to `sink` every frame; keyb-app
+//! routes them to the injection worker (keyb-ui never depends on
+//! keyb-inject).
 
 mod font;
+mod layer_shell;
 mod scene;
+mod winit_shell;
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use keyb_core::{Engine, PointerInput};
+use keyb_core::{Engine, PointerInput, TextEvent};
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
-use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
 
 /// Height of the committed-text ribbon (logical px).
 pub const RIBBON_H: f64 = 56.0;
 /// Origin line: pointer right of this fraction of the canvas zooms in,
 /// left of it zooms out.
 pub const ORIGIN_X_FRAC: f64 = 0.18;
+/// Default height of the OSK strip (logical px) for the layer-shell and X11
+/// dock frontends. `KEYB_HEIGHT` overrides.
+pub const OSK_H: u32 = 380;
 
-struct RenderState {
-    surface: RenderSurface<'static>,
-    window: Arc<Window>,
+/// Receives committed-text changes once per frame, on the UI thread.
+pub type TextSink = Box<dyn FnMut(TextEvent)>;
+
+pub(crate) fn osk_height() -> u32 {
+    std::env::var("KEYB_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(OSK_H)
+        .clamp(160, 2000)
 }
 
-struct App {
-    context: RenderContext,
-    renderers: Vec<Option<Renderer>>,
-    state: Option<RenderState>,
-    scene: Scene,
-    engine: Engine,
-    fonts: font::FontAssets,
-    cursor: (f64, f64),
-    engaged: bool,
+/// Frame logic shared by both frontends: pointer mapping, engine stepping,
+/// event draining, scene building.
+pub(crate) struct Core {
+    pub engine: Engine,
+    pub fonts: font::FontAssets,
+    pub scene: Scene,
+    pub cursor: (f64, f64),
+    pub engaged: bool,
+    pub sink: TextSink,
     last_frame: Instant,
 }
 
-impl App {
+impl Core {
+    pub fn new(engine: Engine, sink: TextSink) -> Result<Self> {
+        Ok(Core {
+            engine,
+            fonts: font::FontAssets::load_system()?,
+            scene: Scene::new(),
+            cursor: (0.0, 0.0),
+            engaged: false,
+            sink,
+            last_frame: Instant::now(),
+        })
+    }
+
+    pub fn adjust_speed(&mut self, delta: f64) {
+        self.engine.speed_bits = (self.engine.speed_bits + delta).clamp(1.0, 10.0);
+    }
+
     fn pointer_input(&self, width: f64, height: f64) -> PointerInput {
         let (px, py) = self.cursor;
         let canvas_h = (height - RIBBON_H).max(1.0);
@@ -61,16 +91,9 @@ impl App {
         }
     }
 
-    fn frame(&mut self) {
-        let Some(state) = &self.state else { return };
-        let size = state.window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        let scale = state.window.scale_factor();
-        let lw = size.width as f64 / scale;
-        let lh = size.height as f64 / scale;
-
+    /// Step the engine and rebuild the scene for a `lw` x `lh` logical-px
+    /// canvas at `scale`. Committed-text changes flow into the sink here.
+    pub fn tick(&mut self, lw: f64, lh: f64, scale: f64) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64().clamp(0.0, 0.05);
         self.last_frame = now;
@@ -78,36 +101,62 @@ impl App {
         let input = self.pointer_input(lw, lh);
         self.engine.set_viewport_px(lh - RIBBON_H);
         self.engine.step(input, dt);
+        for ev in self.engine.drain_text_events() {
+            (self.sink)(ev);
+        }
 
         self.scene.reset();
-        scene::build(
-            &mut self.scene,
-            &self.engine,
-            &self.fonts,
-            lw,
-            lh,
-            scale,
-            input,
-        );
+        scene::build(&mut self.scene, &self.engine, &self.fonts, lw, lh, scale, input);
+    }
+}
 
-        let surface = &self.state.as_ref().unwrap().surface;
-        let dev_id = surface.dev_id;
-        let device_handle = &self.context.devices[dev_id];
+/// One vello render context + per-device renderers, shared by frontends.
+pub(crate) struct Gpu {
+    pub context: RenderContext,
+    renderers: Vec<Option<Renderer>>,
+}
+
+impl Gpu {
+    pub fn new() -> Self {
+        Gpu { context: RenderContext::new(), renderers: Vec::new() }
+    }
+
+    pub fn ensure_renderer(&mut self, dev_id: usize, format: vello::wgpu::TextureFormat) {
+        self.renderers.resize_with(self.context.devices.len().max(dev_id + 1), || None);
+        self.renderers[dev_id].get_or_insert_with(|| {
+            Renderer::new(
+                &self.context.devices[dev_id].device,
+                RendererOptions {
+                    surface_format: Some(format),
+                    use_cpu: false,
+                    antialiasing_support: AaSupport::area_only(),
+                    num_init_threads: None,
+                },
+            )
+            .expect("create renderer")
+        });
+    }
+
+    /// Render `scene` to the surface's current texture. Silently skips an
+    /// outdated swapchain (the next configure/resize fixes it).
+    pub fn render(&mut self, surface: &RenderSurface<'_>, scene: &Scene, w: u32, h: u32) {
+        let device_handle = &self.context.devices[surface.dev_id];
         let surface_texture = match surface.surface.get_current_texture() {
             Ok(t) => t,
-            Err(_) => return, // outdated swapchain; next frame resizes
+            Err(_) => return,
         };
-        let renderer = self.renderers[dev_id].as_mut().unwrap();
-        renderer
+        self.renderers[surface.dev_id]
+            .as_mut()
+            .expect("ensure_renderer ran")
             .render_to_surface(
                 &device_handle.device,
                 &device_handle.queue,
-                &self.scene,
+                scene,
                 &surface_texture,
                 &RenderParams {
                     base_color: Color::from_rgb8(0x14, 0x15, 0x20),
-                    width: size.width,
-                    height: size.height,
+                    width: w,
+                    height: h,
                     antialiasing_method: AaConfig::Area,
                 },
             )
@@ -116,119 +165,54 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
-            return;
-        }
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("keyb")
-                        .with_inner_size(LogicalSize::new(1200.0, 800.0)),
-                )
-                .expect("create window"),
-        );
-        let size = window.inner_size();
-        let surface = pollster::block_on(self.context.create_surface(
-            window.clone(),
-            size.width.max(1),
-            size.height.max(1),
-            vello::wgpu::PresentMode::AutoVsync,
-        ))
-        .expect("create surface");
-        self.renderers
-            .resize_with(self.context.devices.len(), || None);
-        let dev_id = surface.dev_id;
-        self.renderers[dev_id].get_or_insert_with(|| {
-            Renderer::new(
-                &self.context.devices[dev_id].device,
-                RendererOptions {
-                    surface_format: Some(surface.format),
-                    use_cpu: false,
-                    antialiasing_support: AaSupport::area_only(),
-                    num_init_threads: None,
-                },
-            )
-            .expect("create renderer")
-        });
-        self.state = Some(RenderState { surface, window });
-        self.last_frame = Instant::now();
-    }
+/// Which window frontend to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shell {
+    /// Wayland layer-shell overlay (never takes keyboard focus).
+    Layer,
+    /// X11 override-redirect dock strip.
+    X11Osk,
+    /// Ordinary window (development).
+    Window,
+}
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                if let Some(state) = &mut self.state {
-                    self.context
-                        .resize_surface(&mut state.surface, size.width.max(1), size.height.max(1));
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(state) = &self.state {
-                    let scale = state.window.scale_factor();
-                    self.cursor = (position.x / scale, position.y / scale);
-                }
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    self.engaged = state == ElementState::Pressed;
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    match event.logical_key {
-                        Key::Named(NamedKey::Escape) => event_loop.exit(),
-                        Key::Character(ref c) if c == "+" || c == "=" => {
-                            self.engine.speed_bits = (self.engine.speed_bits + 0.5).min(10.0);
-                        }
-                        Key::Character(ref c) if c == "-" => {
-                            self.engine.speed_bits = (self.engine.speed_bits - 0.5).max(1.0);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                self.frame();
-                if let Some(state) = &self.state {
-                    state.window.request_redraw();
-                }
-            }
-            _ => {}
+fn pick_shell() -> Shell {
+    match std::env::var("KEYB_SHELL").ok().as_deref() {
+        Some("layer") => Shell::Layer,
+        Some("x11") => Shell::X11Osk,
+        Some("window") => Shell::Window,
+        Some(other) => {
+            eprintln!("keyb: unknown KEYB_SHELL={other}, using auto");
+            pick_shell_auto()
         }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
-        }
+        None => pick_shell_auto(),
     }
 }
 
-/// Run the UI until the window closes. Takes ownership of the engine.
-pub fn run(engine: Engine) -> Result<()> {
-    let fonts = font::FontAssets::load_system()?;
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App {
-        context: RenderContext::new(),
-        renderers: Vec::new(),
-        state: None,
-        scene: Scene::new(),
-        engine,
-        fonts,
-        cursor: (0.0, 0.0),
-        engaged: false,
-        last_frame: Instant::now(),
-    };
-    event_loop.run_app(&mut app)?;
-    Ok(())
+fn pick_shell_auto() -> Shell {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        Shell::Layer
+    } else if std::env::var_os("DISPLAY").is_some() {
+        Shell::X11Osk
+    } else {
+        Shell::Window
+    }
+}
+
+/// Run the UI until it exits. Takes ownership of the engine; `sink` receives
+/// every committed-text change (SPEC §8).
+pub fn run(engine: Engine, sink: TextSink) -> Result<()> {
+    let core = Core::new(engine, sink)?;
+    match pick_shell() {
+        Shell::Layer => match layer_shell::run(core) {
+            Ok(()) => Ok(()),
+            Err(boxed) => {
+                let (core, e) = *boxed;
+                eprintln!("keyb: layer shell failed ({e:#}); falling back to a window");
+                winit_shell::run(core, false)
+            }
+        },
+        Shell::X11Osk => winit_shell::run(core, true),
+        Shell::Window => winit_shell::run(core, false),
+    }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "keyb-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+x11rb = { version = "0.13", features = ["xtest"] }
+
+[dev-dependencies]
+libc = "0.2"

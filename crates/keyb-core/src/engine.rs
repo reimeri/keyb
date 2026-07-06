@@ -49,6 +49,12 @@ pub struct EngineParams {
     /// Async distribution upgrades animate box sizes toward the new partition
     /// over roughly this long (SPEC §6.3) so boxes never pop.
     pub upgrade_anim_secs: f64,
+    /// Retraction hysteresis: the view may exceed the deepest committed node
+    /// by this fraction of its width before a retraction is considered.
+    /// keyb-app widens this when the active injector lacks true retraction
+    /// (SPEC §8.3) so backspace synthesis into unknown apps needs a firmer
+    /// back-zoom.
+    pub retract_eps: f64,
 }
 
 impl Default for EngineParams {
@@ -63,8 +69,20 @@ impl Default for EngineParams {
             max_depth: 64,
             max_nodes: 4000,
             upgrade_anim_secs: 0.12,
+            retract_eps: 0.02,
         }
     }
+}
+
+/// A change to the committed text, for system output (SPEC §8). Drained by
+/// the front end once per frame and forwarded to the injector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextEvent {
+    /// Text was appended to the committed buffer.
+    Commit(String),
+    /// The last committed symbol was retracted (always one symbol; its
+    /// decoded char count is up to the ledger on the injection side).
+    Retract(String),
 }
 
 struct Node {
@@ -126,12 +144,11 @@ pub struct Engine {
     viewport_px: f64,
     /// Current speed cap in bits/s; UI may adjust, sim sets directly.
     pub speed_bits: f64,
+    /// Committed-text changes since the last `drain_text_events` call.
+    events: Vec<TextEvent>,
 }
 
 const ROOT: usize = 0;
-/// View may exceed the deepest committed node by this fraction of its width
-/// before a retraction is considered (overshoot hysteresis).
-const RETRACT_EPS: f64 = 0.02;
 const MIN_VIEW_W: f64 = 1e-9;
 const MAX_VIEW_W: f64 = 4.0;
 
@@ -200,6 +217,7 @@ impl Engine {
             outside_timer: 0.0,
             viewport_px: 800.0,
             speed_bits: params.max_bits_per_sec,
+            events: Vec::new(),
         }
     }
 
@@ -217,6 +235,12 @@ impl Engine {
 
     pub fn view(&self) -> (f64, f64) {
         (self.view_lo, self.view_hi)
+    }
+
+    /// Committed-text changes since the last call, in order (SPEC §8). The
+    /// front end forwards these to the injection worker every frame.
+    pub fn drain_text_events(&mut self) -> Vec<TextEvent> {
+        std::mem::take(&mut self.events)
     }
 
     fn tail_len(&self) -> usize {
@@ -659,7 +683,7 @@ impl Engine {
     /// Does the deepest committed node still hold the view, within the
     /// retraction hysteresis? A missing tree link counts as "no".
     fn committed_node_holds_view(&self) -> bool {
-        let eps = RETRACT_EPS * (self.view_hi - self.view_lo);
+        let eps = self.params.retract_eps * (self.view_hi - self.view_lo);
         let mut cur = ROOT;
         for &s in &self.committed[self.ledger.len()..] {
             if !self.nodes[cur].expanded {
@@ -699,11 +723,14 @@ impl Engine {
             }
             // Commit the whole contained chain — deeper containment implies
             // the first link was contained throughout the debounce.
+            let mut text = String::new();
             for &id in &chain[tail..] {
                 let sym = self.nodes[id].sym;
                 self.lm.learn(&self.committed, sym);
                 self.committed.push(sym);
+                text.push(self.alphabet.char_of(sym));
             }
+            self.events.push(TextEvent::Commit(text));
             self.commit_candidate = None;
             self.commit_timer = 0.0;
         } else if on_track {
@@ -726,6 +753,8 @@ impl Engine {
             self.outside_timer = 0.0;
             let sym = self.committed.pop().expect("tail > 0 when off track");
             self.lm.unlearn(&self.committed, sym);
+            self.events
+                .push(TextEvent::Retract(self.alphabet.char_of(sym).to_string()));
         }
     }
 
@@ -854,6 +883,31 @@ mod tests {
             }
         }
         assert!(e.committed_syms().is_empty(), "retraction should undo commit");
+    }
+
+    #[test]
+    fn text_events_mirror_commits_and_retractions() {
+        let mut e = engine();
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        assert!(steer_to(&mut e, &[0], 600), "should commit 'a'");
+        let evs = e.drain_text_events();
+        assert!(
+            evs.iter().any(|ev| matches!(ev, TextEvent::Commit(s) if s.contains('a'))),
+            "commit must emit an event: {evs:?}"
+        );
+        for _ in 0..600 {
+            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            if e.committed_syms().is_empty() {
+                break;
+            }
+        }
+        let evs = e.drain_text_events();
+        assert!(
+            evs.iter().any(|ev| matches!(ev, TextEvent::Retract(s) if s == "a")),
+            "retraction must emit an event: {evs:?}"
+        );
+        assert!(e.drain_text_events().is_empty(), "drain must clear the queue");
     }
 
     #[test]

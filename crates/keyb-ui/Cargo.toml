@@ -11,3 +11,10 @@ winit = "0.30"
 skrifa = "0.26"
 pollster = "0.4"
 anyhow = "1"
+# Layer-shell frontend (SPEC §7.3): winit has no layer-shell, so this
+# frontend talks to the compositor directly and bridges the raw wl_surface
+# into wgpu. client_system matches what winit/wgpu need for pointer handles.
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+raw-window-handle = "0.6"

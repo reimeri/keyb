@@ -5,6 +5,7 @@ members = [
     "crates/keyb-lm-ppm",
     "crates/keyb-lm-llama",
     "crates/keyb-ui",
+    "crates/keyb-inject",
     "crates/keyb-app",
 ]
 

@@ -9,5 +9,5 @@ pub mod lm;
 pub mod sim;
 
 pub use alphabet::Alphabet;
-pub use engine::{BoxView, Engine, EngineParams, PointerInput};
+pub use engine::{BoxView, Engine, EngineParams, PointerInput, TextEvent};
 pub use lm::LanguageModel;

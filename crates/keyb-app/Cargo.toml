@@ -14,3 +14,5 @@ keyb-lm-ppm = { path = "../keyb-lm-ppm" }
 keyb-ui = { path = "../keyb-ui" }
 anyhow = "1"
 keyb-lm-llama = { path = "../keyb-lm-llama" }
+keyb-inject = { path = "../keyb-inject" }
+crossbeam-channel = "0.5"

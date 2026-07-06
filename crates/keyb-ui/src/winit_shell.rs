@@ -1,0 +1,191 @@
+//! winit frontend: a plain window for development, or an X11
+//! override-redirect dock strip for OSK use (SPEC §7.3).
+//!
+//! Override-redirect makes the window unmanaged: the WM never gives it
+//! keyboard focus, so clicks steer keyb while keystrokes keep flowing to the
+//! target app — the X11 analogue of layer-shell `keyboard_interactivity:
+//! none`. `_NET_WM_WINDOW_TYPE_DOCK` keeps compositing WMs from shadowing or
+//! animating it.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+
+use crate::{osk_height, Core, Gpu};
+
+struct RenderState {
+    surface: vello::util::RenderSurface<'static>,
+    window: Arc<Window>,
+}
+
+struct App {
+    core: Core,
+    gpu: Gpu,
+    state: Option<RenderState>,
+    /// Borderless bottom-anchored override-redirect strip instead of a
+    /// normal window.
+    osk: bool,
+}
+
+impl App {
+    fn frame(&mut self) {
+        let Some(state) = &self.state else { return };
+        let size = state.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let scale = state.window.scale_factor();
+        self.core
+            .tick(size.width as f64 / scale, size.height as f64 / scale, scale);
+        let state = self.state.as_ref().expect("checked above");
+        self.gpu
+            .render(&state.surface, &self.core.scene, size.width, size.height);
+    }
+
+    fn window_attributes(&self, event_loop: &ActiveEventLoop) -> winit::window::WindowAttributes {
+        let attrs = Window::default_attributes().with_title("keyb");
+        if !self.osk {
+            return attrs.with_inner_size(LogicalSize::new(1200.0, 800.0));
+        }
+        // Bottom strip across the primary monitor.
+        let monitor = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next());
+        let (msize, mpos, mscale) = monitor
+            .map(|m| (m.size(), m.position(), m.scale_factor()))
+            .unwrap_or((PhysicalSize::new(1920, 1080), PhysicalPosition::new(0, 0), 1.0));
+        let h = (osk_height() as f64 * mscale) as u32;
+        let attrs = attrs
+            .with_inner_size(PhysicalSize::new(msize.width, h))
+            .with_position(PhysicalPosition::new(
+                mpos.x,
+                mpos.y + msize.height.saturating_sub(h) as i32,
+            ))
+            .with_decorations(false)
+            .with_resizable(false);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attrs = {
+            use winit::platform::x11::{WindowAttributesExtX11, WindowType};
+            attrs
+                .with_override_redirect(true)
+                .with_x11_window_type(vec![WindowType::Dock])
+        };
+        attrs
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(self.window_attributes(event_loop))
+                .expect("create window"),
+        );
+        let size = window.inner_size();
+        let surface = pollster::block_on(self.gpu.context.create_surface(
+            window.clone(),
+            size.width.max(1),
+            size.height.max(1),
+            vello::wgpu::PresentMode::AutoVsync,
+        ))
+        .expect("create surface");
+        self.gpu.ensure_renderer(surface.dev_id, surface.format);
+        self.state = Some(RenderState { surface, window });
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(state) = &mut self.state {
+                    self.gpu.context.resize_surface(
+                        &mut state.surface,
+                        size.width.max(1),
+                        size.height.max(1),
+                    );
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(state) = &self.state {
+                    let scale = state.window.scale_factor();
+                    self.core.cursor = (position.x / scale, position.y / scale);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // No pointer capture yet: a drag that escapes the window
+                // would otherwise stay engaged forever.
+                self.core.engaged = false;
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    self.core.engaged = state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
+                };
+                self.core.adjust_speed(0.25 * lines);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    match event.logical_key {
+                        Key::Named(NamedKey::Escape) => event_loop.exit(),
+                        Key::Character(ref c) if c == "+" || c == "=" => {
+                            self.core.adjust_speed(0.5);
+                        }
+                        Key::Character(ref c) if c == "-" => {
+                            self.core.adjust_speed(-0.5);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.frame();
+                if let Some(state) = &self.state {
+                    state.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+}
+
+/// Run under winit until the window closes. `osk` selects the
+/// override-redirect dock strip (X11 targets).
+pub fn run(core: Core, osk: bool) -> Result<()> {
+    let event_loop = if osk {
+        // The OSK strip is X11-only behavior; force the X11 backend even
+        // when a Wayland display is also reachable (KEYB_SHELL=x11).
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            EventLoop::builder().with_x11().build()?
+        }
+        #[cfg(any(not(unix), target_os = "macos"))]
+        EventLoop::new()?
+    } else {
+        EventLoop::new()?
+    };
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = App { core, gpu: Gpu::new(), state: None, osk };
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
