@@ -14,6 +14,13 @@ use crate::{ORIGIN_X_FRAC, RIBBON_H};
 
 /// Labels appear once a box is at least this tall (px).
 const LABEL_MIN_PX: f64 = 18.0;
+
+/// Hit-testable rectangle (logical px) of the `×` hide button, in the ribbon's
+/// top-right corner. Single source of truth for both drawing and click
+/// hit-testing across frontends.
+pub fn hide_button_rect(lw: f64) -> Rect {
+    Rect::new(lw - 42.0, 12.0, lw - 14.0, 40.0)
+}
 /// Extra gap (px) reserved between a box's label glyph and its nearest child's
 /// left edge, so the glyph is never touched by the child's fill.
 const LABEL_PAD: f64 = 4.0;
@@ -238,6 +245,28 @@ pub fn build(
             .draw(Fill::NonZero, glyphs.into_iter());
     }
 
+    // Hide button: an `×` in the ribbon's top-right corner (drawn on top of the
+    // ribbon). Clicking it collapses the OSK to the edge handle.
+    let btn = hide_button_rect(lw);
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
+        None,
+        &RoundedRect::from_rect(btn, 6.0),
+    );
+    let x_px = (btn.height() * 0.72) as f32;
+    let (glyphs, adv) = fonts.layout("\u{00D7}", x_px);
+    scene
+        .draw_glyphs(&fonts.font)
+        .font_size(x_px)
+        .transform(t * Affine::translate((
+            btn.center().x - adv as f64 / 2.0,
+            btn.center().y + x_px as f64 * 0.35,
+        )))
+        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
+        .draw(Fill::NonZero, glyphs.into_iter());
+
     // Speed readout, bottom-left.
     let (glyphs, _) = fonts.layout(
         &format!("speed {:.1} bits per s   plus and minus adjust", engine.speed_bits),
@@ -248,6 +277,32 @@ pub fn build(
         .font_size(13.0)
         .transform(t * Affine::translate((12.0, lh - 10.0)))
         .brush(Color::from_rgba8(0xFF, 0xFF, 0xFF, 110))
+        .draw(Fill::NonZero, glyphs.into_iter());
+}
+
+/// Collapsed state: a small rounded tab filling the handle surface (`lw`x`lh`),
+/// with a centered chevron hinting "click to open". No engine data needed.
+pub fn build_handle(scene: &mut Scene, fonts: &FontAssets, lw: f64, lh: f64, scale: f64) {
+    let t = Affine::scale(scale);
+    let tab = RoundedRect::new(2.0, 2.0, lw - 2.0, lh - 2.0, 8.0);
+    scene.fill(Fill::NonZero, t, Color::from_rgb8(0x24, 0x28, 0x38), None, &tab);
+    scene.stroke(
+        &Stroke::new(1.0),
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 60),
+        None,
+        &tab,
+    );
+    let font_px = (lw * 0.7) as f32;
+    let (glyphs, adv) = fonts.layout("\u{2039}", font_px); // ‹
+    scene
+        .draw_glyphs(&fonts.font)
+        .font_size(font_px)
+        .transform(t * Affine::translate((
+            lw / 2.0 - adv as f64 / 2.0,
+            lh / 2.0 + font_px as f64 * 0.35,
+        )))
+        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
 }
 
@@ -285,9 +340,19 @@ fn hsl(h: f64, s: f64, l: f64) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{box_left_edges, LABEL_PAD};
+    use super::{box_left_edges, hide_button_rect, LABEL_PAD};
+    use crate::RIBBON_H;
 
     const LW: f64 = 620.0;
+
+    /// The hide button sits fully inside the ribbon and against the right edge.
+    #[test]
+    fn hide_button_in_ribbon() {
+        let r = hide_button_rect(LW);
+        assert!(r.x0 >= 0.0 && r.x1 <= LW, "within canvas width");
+        assert!(r.y0 >= 0.0 && r.y1 <= RIBBON_H, "within the ribbon");
+        assert!(r.x1 > LW * 0.8, "anchored to the right");
+    }
 
     /// Reserve reserved for a labeled box of height `h` with glyph advance `adv`.
     fn margin(h: f64, adv: f64) -> f64 {

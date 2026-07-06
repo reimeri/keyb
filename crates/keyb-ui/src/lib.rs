@@ -33,6 +33,10 @@ pub const ORIGIN_X_FRAC: f64 = 0.18;
 /// overrides; otherwise the column is ~1/3 of the output width. The column is
 /// always full height.
 pub const OSK_W: u32 = 620;
+/// Size of the collapsed handle/tab (logical px) shown on the screen edge when
+/// the keyboard is hidden. Clicking it (or a SIGUSR1) brings the OSK back.
+pub const HANDLE_W: u32 = 28;
+pub const HANDLE_H: u32 = 110;
 
 /// Receives committed-text changes once per frame, on the UI thread.
 pub type TextSink = Box<dyn FnMut(TextEvent)>;
@@ -56,6 +60,9 @@ pub(crate) struct Core {
     pub scene: Scene,
     pub cursor: (f64, f64),
     pub engaged: bool,
+    /// Whether the OSK is shown. When false the engine is frozen and only the
+    /// collapsed handle is drawn (SPEC §7.3: dismissible overlay).
+    pub visible: bool,
     pub sink: TextSink,
     last_frame: Instant,
 }
@@ -68,6 +75,7 @@ impl Core {
             scene: Scene::new(),
             cursor: (0.0, 0.0),
             engaged: false,
+            visible: true,
             sink,
             last_frame: Instant::now(),
         })
@@ -103,6 +111,13 @@ impl Core {
         let dt = (now - self.last_frame).as_secs_f64().clamp(0.0, 0.05);
         self.last_frame = now;
 
+        self.scene.reset();
+        if !self.visible {
+            // Frozen: no engine step, no commits — just the collapsed handle.
+            scene::build_handle(&mut self.scene, &self.fonts, lw, lh, scale);
+            return;
+        }
+
         let input = self.pointer_input(lw, lh);
         self.engine.set_viewport_px(lh - RIBBON_H);
         self.engine.step(input, dt);
@@ -110,7 +125,6 @@ impl Core {
             (self.sink)(ev);
         }
 
-        self.scene.reset();
         scene::build(&mut self.scene, &self.engine, &self.fonts, lw, lh, scale, input);
     }
 }

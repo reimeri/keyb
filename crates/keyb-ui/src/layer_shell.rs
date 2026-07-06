@@ -40,7 +40,8 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-use crate::{osk_width, Core, Gpu};
+use crate::scene::hide_button_rect;
+use crate::{osk_width, Core, Gpu, HANDLE_H, HANDLE_W};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
 const BTN_LEFT: u32 = 0x110;
@@ -93,6 +94,9 @@ struct AppState {
     /// Logical size from the last configure.
     width: u32,
     height: u32,
+    /// Shown column width, preserved across a hide (while hidden, `width` holds
+    /// the small handle size instead).
+    full_width: u32,
     scale: i32,
     configured: bool,
     exit: bool,
@@ -134,11 +138,32 @@ impl AppState {
             return;
         };
         let want = osk_width(Some(ow as u32));
-        if want != self.width {
+        self.full_width = want;
+        // While hidden, only record the new width; it applies on the next show.
+        if self.core.visible && want != self.width {
             self.width = want;
             self.layer.set_size(want, 0);
             self.layer.commit();
         }
+    }
+
+    /// Toggle the OSK between the full column and the collapsed edge handle by
+    /// resizing the layer surface. The following `configure` carries the new
+    /// size and repaints.
+    fn set_visible(&mut self, vis: bool) {
+        if self.core.visible == vis {
+            return;
+        }
+        self.core.visible = vis;
+        self.core.engaged = false;
+        if vis {
+            self.layer.set_anchor(Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
+            self.layer.set_size(self.full_width, 0);
+        } else {
+            self.layer.set_anchor(Anchor::RIGHT);
+            self.layer.set_size(HANDLE_W, HANDLE_H);
+        }
+        self.layer.commit();
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -147,9 +172,12 @@ impl AppState {
         }
         self.core
             .tick(self.width as f64, self.height as f64, self.scale as f64);
-        // Ask for the next vsync tick before presenting this frame.
-        let s = self.layer.wl_surface();
-        s.frame(qh, s.clone());
+        // Ask for the next vsync tick only while visible; the collapsed handle
+        // is static, so hidden draws once and the loop goes idle.
+        if self.core.visible {
+            let s = self.layer.wl_surface();
+            s.frame(qh, s.clone());
+        }
         let (pw, ph) = self.physical();
         let rs = self.render_surface.as_ref().expect("checked above");
         self.gpu.render(rs, &self.core.scene, pw, ph);
@@ -235,11 +263,10 @@ impl LayerShellHandler for AppState {
         self.width = if w == 0 { self.width } else { w };
         self.height = if h == 0 { self.height } else { h };
         self.resize();
-        let first = !self.configured;
         self.configured = true;
-        if first {
-            self.draw(qh);
-        }
+        // Repaint on every configure so a visibility toggle's resize is drawn
+        // (hidden draws don't re-arm frames, so this is the only redraw then).
+        self.draw(qh);
     }
 }
 
@@ -313,7 +340,17 @@ impl PointerHandler for AppState {
                 }
                 PointerEventKind::Motion { .. } => self.core.cursor = ev.position,
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
-                    self.core.engaged = true;
+                    let (cx, cy) = self.core.cursor;
+                    if !self.core.visible {
+                        // Any tap on the collapsed handle reopens the OSK.
+                        self.set_visible(true);
+                    } else if hide_button_rect(self.width as f64)
+                        .contains(vello::kurbo::Point::new(cx, cy))
+                    {
+                        self.set_visible(false);
+                    } else {
+                        self.core.engaged = true;
+                    }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
                     self.core.engaged = false;
@@ -358,7 +395,9 @@ delegate_registry!(AppState);
 /// On failure the core comes back so the caller can fall back to a window.
 pub type LayerError = Box<(Core, anyhow::Error)>;
 
-/// Run as a layer-shell overlay.
+/// Run as a layer-shell overlay. Redraw is frame-callback driven while the OSK
+/// is shown; when hidden it draws the static handle once and the loop idles
+/// until the next pointer event (a tap on the handle brings it back).
 pub fn run(core: Core) -> Result<(), LayerError> {
     match setup(core) {
         Ok((mut state, mut queue)) => loop {
@@ -458,6 +497,7 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
             render_surface: Some(render_surface),
             width: w,
             height: h,
+            full_width: w,
             scale: 1,
             configured: false,
             exit: false,

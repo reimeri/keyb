@@ -48,6 +48,25 @@ impl App {
             .render(&state.surface, &self.core.scene, size.width, size.height);
     }
 
+    /// Left-button press: toggle visibility via the hide button / edge handle,
+    /// otherwise engage steering (mirrors the layer-shell frontend).
+    fn press(&mut self) {
+        let Some(state) = &self.state else { return };
+        let scale = state.window.scale_factor();
+        let lw = state.window.inner_size().width as f64 / scale;
+        let (cx, cy) = self.core.cursor;
+        if !self.core.visible {
+            self.core.visible = true;
+        } else if crate::scene::hide_button_rect(lw)
+            .contains(vello::kurbo::Point::new(cx, cy))
+        {
+            self.core.visible = false;
+            self.core.engaged = false;
+        } else {
+            self.core.engaged = true;
+        }
+    }
+
     fn window_attributes(&self, event_loop: &ActiveEventLoop) -> winit::window::WindowAttributes {
         let attrs = Window::default_attributes().with_title("keyb");
         if !self.osk {
@@ -135,7 +154,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
-                    self.core.engaged = state == ElementState::Pressed;
+                    if state == ElementState::Pressed {
+                        self.press();
+                    } else {
+                        self.core.engaged = false;
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
