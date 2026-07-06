@@ -53,10 +53,11 @@ impl FontAssets {
         let mut pen = 0.0f32;
         let mut glyphs = Vec::with_capacity(text.chars().count());
         for ch in text.chars() {
-            // '·' is a safe stand-in if the visible-space glyph is missing.
+            // '_' is a safe stand-in if the open-box space glyph is missing; a
+            // low bar stays clearly distinct from a period (unlike a mid-dot).
             let gid = charmap
                 .map(ch)
-                .or_else(|| if ch == '␣' { charmap.map('·') } else { None })
+                .or_else(|| if ch == '␣' { charmap.map('_') } else { None })
                 .unwrap_or_default();
             glyphs.push(Glyph {
                 id: gid.to_u32(),

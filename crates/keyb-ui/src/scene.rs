@@ -207,7 +207,7 @@ pub fn build(
         .into_iter()
         .rev()
         .collect();
-    let shown = tail.replace(' ', "\u{00B7}"); // make spaces visible in the ribbon
+    let shown = tail.replace(' ', "\u{2423}"); // make spaces visible in the ribbon
     let (glyphs, adv) = fonts.layout(&shown, font_px);
     let baseline = RIBBON_H * 0.68;
     scene
@@ -229,7 +229,7 @@ pub fn build(
         ),
     );
     if !pending.is_empty() {
-        let (glyphs, _) = fonts.layout(&pending.replace(' ', "\u{00B7}"), font_px);
+        let (glyphs, _) = fonts.layout(&pending.replace(' ', "\u{2423}"), font_px);
         scene
             .draw_glyphs(&fonts.font)
             .font_size(font_px)
