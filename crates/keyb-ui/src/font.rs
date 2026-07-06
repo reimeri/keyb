@@ -43,6 +43,14 @@ impl FontAssets {
         skrifa::FontRef::from_index(&self.data, 0).context("parsing font")
     }
 
+    /// Whether the font has a real glyph for `ch` (not notdef). Lets callers
+    /// pick an ASCII stand-in for symbols the system font may lack.
+    pub fn has_glyph(&self, ch: char) -> bool {
+        self.font_ref()
+            .map(|fref| fref.charmap().map(ch).is_some())
+            .unwrap_or(false)
+    }
+
     /// Lay out `text` at `size` px: glyphs with pen positions plus total advance.
     pub fn layout(&self, text: &str, size: f32) -> (Vec<Glyph>, f32) {
         let Ok(fref) = self.font_ref() else {

@@ -85,6 +85,13 @@ impl Core {
         self.engine.speed_bits = (self.engine.speed_bits + delta).clamp(1.0, 10.0);
     }
 
+    /// Reset the engine to its start state and drop any in-progress steering.
+    /// Text already injected into the target app is left untouched (SPEC §7).
+    pub fn reset(&mut self) {
+        self.engine.reset();
+        self.engaged = false;
+    }
+
     fn pointer_input(&self, width: f64, height: f64) -> PointerInput {
         let (px, py) = self.cursor;
         let canvas_h = (height - RIBBON_H).max(1.0);

@@ -40,7 +40,7 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-use crate::scene::hide_button_rect;
+use crate::scene::{hide_button_rect, reset_button_rect};
 use crate::{osk_width, Core, Gpu, HANDLE_H, HANDLE_W};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
@@ -348,6 +348,10 @@ impl PointerHandler for AppState {
                         .contains(vello::kurbo::Point::new(cx, cy))
                     {
                         self.set_visible(false);
+                    } else if reset_button_rect(self.width as f64)
+                        .contains(vello::kurbo::Point::new(cx, cy))
+                    {
+                        self.core.reset();
                     } else {
                         self.core.engaged = true;
                     }

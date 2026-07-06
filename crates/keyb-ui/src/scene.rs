@@ -21,6 +21,12 @@ const LABEL_MIN_PX: f64 = 18.0;
 pub fn hide_button_rect(lw: f64) -> Rect {
     Rect::new(lw - 42.0, 12.0, lw - 14.0, 40.0)
 }
+/// Hit-testable rectangle (logical px) of the reset button, one button-width to
+/// the left of the `×` hide button. Tapping it returns the engine to its start
+/// state (SPEC §7). Single source of truth for drawing and hit-testing.
+pub fn reset_button_rect(lw: f64) -> Rect {
+    Rect::new(lw - 76.0, 12.0, lw - 48.0, 40.0)
+}
 /// Extra gap (px) reserved between a box's label glyph and its nearest child's
 /// left edge, so the glyph is never touched by the child's fill.
 const LABEL_PAD: f64 = 4.0;
@@ -275,6 +281,31 @@ pub fn build(
         .transform(t * Affine::translate((
             btn.center().x - adv as f64 / 2.0,
             btn.center().y + x_px as f64 * 0.35,
+        )))
+        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
+        .draw(Fill::NonZero, glyphs.into_iter());
+
+    // Reset button: a `↺` just left of the hide button. Clicking it returns the
+    // engine to its start state (fresh tree, empty context) without touching
+    // text already typed into the target app. Falls back to `R` where the system
+    // font lacks the circular-arrow glyph.
+    let btn = reset_button_rect(lw);
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
+        None,
+        &RoundedRect::from_rect(btn, 6.0),
+    );
+    let r_px = (btn.height() * 0.72) as f32;
+    let label = if fonts.has_glyph('\u{21BA}') { "\u{21BA}" } else { "R" };
+    let (glyphs, adv) = fonts.layout(label, r_px);
+    scene
+        .draw_glyphs(&fonts.font)
+        .font_size(r_px)
+        .transform(t * Affine::translate((
+            btn.center().x - adv as f64 / 2.0,
+            btn.center().y + r_px as f64 * 0.35,
         )))
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());

@@ -62,6 +62,10 @@ impl App {
         {
             self.core.visible = false;
             self.core.engaged = false;
+        } else if crate::scene::reset_button_rect(lw)
+            .contains(vello::kurbo::Point::new(cx, cy))
+        {
+            self.core.reset();
         } else {
             self.core.engaged = true;
         }

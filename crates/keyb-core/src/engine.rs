@@ -207,6 +207,22 @@ fn copy_subtree(
     idx
 }
 
+/// A single fresh root node covering the whole frame [0, 1). The tree starts
+/// here, and `Engine::reset` returns to exactly this.
+fn root_node() -> Node {
+    Node {
+        sym: 0,
+        lo: 0.0,
+        hi: 1.0,
+        depth: 0,
+        parent: ROOT,
+        children: Vec::new(),
+        expanded: false,
+        alive: true,
+        anim_target: None,
+    }
+}
+
 impl Engine {
     pub fn new(alphabet: Alphabet, lm: Box<dyn LanguageModel>, params: EngineParams) -> Self {
         assert_eq!(lm.alphabet_len(), alphabet.len());
@@ -214,17 +230,7 @@ impl Engine {
             alphabet,
             lm,
             params,
-            nodes: vec![Node {
-                sym: 0,
-                lo: 0.0,
-                hi: 1.0,
-                depth: 0,
-                parent: ROOT,
-                children: Vec::new(),
-                expanded: false,
-                alive: true,
-                anim_target: None,
-            }],
+            nodes: vec![root_node()],
             view_lo: 0.0,
             view_hi: 1.0,
             committed: Vec::new(),
@@ -237,6 +243,29 @@ impl Engine {
             speed_bits: params.max_bits_per_sec,
             events: Vec::new(),
         }
+    }
+
+    /// Return the model to its just-constructed state — tree back to the root,
+    /// committed buffer and prediction context wiped — while keeping the
+    /// alphabet, language model, params, and current viewport. The LM's adaptive
+    /// state is rewound by replaying `unlearn` over the committed buffer in
+    /// reverse commit order (the exact inverse of the commit path), so
+    /// predictions return to baseline. No `TextEvent` is emitted: text already
+    /// injected into the target application is deliberately left untouched.
+    pub fn reset(&mut self) {
+        while let Some(sym) = self.committed.pop() {
+            self.lm.unlearn(&self.committed, sym);
+        }
+        self.nodes = vec![root_node()];
+        self.view_lo = 0.0;
+        self.view_hi = 1.0;
+        self.ledger.clear();
+        self.commit_candidate = None;
+        self.commit_timer = 0.0;
+        self.outside_timer = 0.0;
+        self.was_engaged = false;
+        self.speed_bits = self.params.max_bits_per_sec;
+        self.events.clear();
     }
 
     pub fn set_viewport_px(&mut self, px: f64) {
@@ -1193,5 +1222,62 @@ mod tests {
             }
         }
         assert!(saw_preview, "pending path must show 'a' before it commits");
+    }
+
+    /// Records every learn/unlearn as a signed count per (context, sym) in a
+    /// shared map, so a balanced session leaves all counts at zero. Predictions
+    /// stay uniform.
+    struct CountingModel {
+        n: usize,
+        counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(Vec<u8>, u8), i64>>>,
+    }
+
+    impl LanguageModel for CountingModel {
+        fn predict(&mut self, _context: &[u8]) -> Vec<f64> {
+            vec![1.0 / self.n as f64; self.n]
+        }
+        fn learn(&mut self, context: &[u8], sym: u8) {
+            *self.counts.lock().unwrap().entry((context.to_vec(), sym)).or_default() += 1;
+        }
+        fn unlearn(&mut self, context: &[u8], sym: u8) {
+            *self.counts.lock().unwrap().entry((context.to_vec(), sym)).or_default() -= 1;
+        }
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    #[test]
+    fn reset_clears_state_and_rewinds_lm() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let counts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let lm = CountingModel { n, counts: counts.clone() };
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        // Low rebase threshold forces frame advances so the ledger is exercised.
+        e.params.rebase_view_w = 0.5;
+        assert!(steer_to(&mut e, &[1, 0, 2], 3000), "should write 'bac'");
+        assert!(!e.committed_syms().is_empty());
+        assert!(!e.ledger.is_empty(), "frame should have advanced");
+        assert!(
+            counts.lock().unwrap().values().any(|&c| c != 0),
+            "committing must have taught the LM something to rewind"
+        );
+        e.drain_text_events();
+
+        e.reset();
+
+        assert!(e.committed_syms().is_empty(), "committed buffer cleared");
+        assert!(e.ledger.is_empty(), "ledger cleared");
+        assert_eq!(e.view(), (0.0, 1.0), "view back at the root frame");
+        assert_eq!(e.nodes.len(), 1, "tree back to a single root");
+        assert_eq!(e.speed_bits, e.params.max_bits_per_sec, "speed restored");
+        assert!(e.drain_text_events().is_empty(), "reset emits no text events");
+        assert!(
+            counts.lock().unwrap().values().all(|&c| c == 0),
+            "reset must unlearn every commit, leaving the LM at baseline"
+        );
     }
 }
