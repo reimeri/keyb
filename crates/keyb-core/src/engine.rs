@@ -55,6 +55,14 @@ pub struct EngineParams {
     /// (SPEC §8.3) so backspace synthesis into unknown apps needs a firmer
     /// back-zoom.
     pub retract_eps: f64,
+    /// Release-commit gate: when steering disengages (button released), any
+    /// crosshair-path box taller than this fraction of the view is committed
+    /// on the spot, even though it never fully engulfed the view. Lets a user
+    /// steer at a target and let go rather than zoom all the way in — handy
+    /// for landing a space/period to end a sentence. Boxes below the fraction
+    /// stay uncommitted, so pausing mid-word never dumps tiny speculative
+    /// descendants into the buffer.
+    pub commit_release_frac: f64,
 }
 
 impl Default for EngineParams {
@@ -70,6 +78,7 @@ impl Default for EngineParams {
             max_nodes: 4000,
             upgrade_anim_secs: 0.12,
             retract_eps: 0.02,
+            commit_release_frac: 0.5,
         }
     }
 }
@@ -147,6 +156,8 @@ pub struct Engine {
     commit_candidate: Option<u8>, // symbol of first uncommitted contained node
     commit_timer: f64,
     outside_timer: f64,
+    /// Engaged state of the previous `step`, to catch the release edge.
+    was_engaged: bool,
     viewport_px: f64,
     /// Current speed cap in bits/s; UI may adjust, sim sets directly.
     pub speed_bits: f64,
@@ -221,6 +232,7 @@ impl Engine {
             commit_candidate: None,
             commit_timer: 0.0,
             outside_timer: 0.0,
+            was_engaged: false,
             viewport_px: 800.0,
             speed_bits: params.max_bits_per_sec,
             events: Vec::new(),
@@ -264,6 +276,15 @@ impl Engine {
         self.climb_out_if_outside();
         self.maintain_tree();
         self.send_frame_hint();
+        // A genuine button release (engaged high → low) lands the letters the
+        // crosshair is clearly over, ahead of the containment debounce. The
+        // frontends also drop `engaged` as a fail-safe when the pointer escapes
+        // the column mid-drag; the release-commit fraction gate keeps that from
+        // committing anything the user hadn't already zoomed well into.
+        if self.was_engaged && !input.engaged {
+            self.commit_under_crosshair();
+        }
+        self.was_engaged = input.engaged;
         self.update_commit(dt, input.engaged);
         self.advance_frame_if_deep();
     }
@@ -764,6 +785,46 @@ impl Engine {
         }
     }
 
+    /// On release, commit the crosshair-path boxes that dominate the view
+    /// (height ≥ `commit_release_frac`), ahead of the containment debounce, so
+    /// letting go lands the letter you were steering at. Geometry is untouched,
+    /// exactly like a debounced commit — only the watermark and the LM move.
+    /// A no-op while the crosshair path disagrees with the committed tail
+    /// (mid-retraction) or nothing yet dominates.
+    fn commit_under_crosshair(&mut self) {
+        let w = self.view_hi - self.view_lo;
+        let path = self.center_path();
+        let tail = self.tail_len();
+        if path.len() <= tail {
+            return;
+        }
+        let on_track = path[..tail]
+            .iter()
+            .map(|&i| self.nodes[i].sym)
+            .eq(self.committed[self.ledger.len()..].iter().copied());
+        if !on_track {
+            return;
+        }
+        let mut text = String::new();
+        for &id in &path[tail..] {
+            let (lo, hi, sym) = {
+                let n = &self.nodes[id];
+                (n.lo, n.hi, n.sym)
+            };
+            if hi - lo < self.params.commit_release_frac * w {
+                break; // deeper boxes are smaller still; stop at the first misfit
+            }
+            self.lm.learn(&self.committed, sym);
+            self.committed.push(sym);
+            text.push(self.alphabet.char_of(sym));
+        }
+        if !text.is_empty() {
+            self.events.push(TextEvent::Commit(text));
+            self.commit_candidate = None;
+            self.commit_timer = 0.0;
+        }
+    }
+
     /// Interval, in current-frame coordinates, of a continuation `next`
     /// beyond the committed text. Follows actual tree geometry where nodes
     /// exist (the LM may have learned since a node was laid out) and extends
@@ -1060,6 +1121,56 @@ mod tests {
         let w1 = e.nodes[first].hi - e.nodes[first].lo;
         assert!((w1 - 0.5).abs() < 1e-6, "must converge to upgraded size: {w1}");
         assert!(e.nodes[ROOT].anim_target.is_none(), "animation must finish");
+    }
+
+    #[test]
+    fn release_commits_dominant_crosshair_letter() {
+        let mut e = engine();
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 6.0;
+        let mut released = false;
+        for _ in 0..600 {
+            // Aim at the center of symbol 0's interval and zoom in.
+            let (lo, hi) = e.path_interval(&[0]);
+            let target = (lo + hi) / 2.0;
+            let (v_lo, v_hi) = e.view();
+            let w = v_hi - v_lo;
+            let y = (target - v_lo) / w;
+            // Has 'a' grown to dominate the view without fully engulfing it
+            // (so the containment debounce hasn't fired)?
+            let dominant = e.center_path().first().is_some_and(|&i| {
+                let n = &e.nodes[i];
+                n.sym == 0
+                    && n.hi - n.lo >= e.params.commit_release_frac * w
+                    && !(n.lo <= v_lo && n.hi >= v_hi)
+            });
+            assert!(e.committed_syms().is_empty(), "must not auto-commit before dominance");
+            if dominant {
+                // Let go: the dominant letter must commit even though it never
+                // fully engulfed the view.
+                e.step(PointerInput { dx: 0.0, y, engaged: false }, 1.0 / 60.0);
+                assert_eq!(e.committed_syms(), [0], "release must land the dominant letter");
+                let evs = e.drain_text_events();
+                assert!(
+                    evs.iter().any(|ev| matches!(ev, TextEvent::Commit(s) if s == "a")),
+                    "release commit must emit an event: {evs:?}"
+                );
+                released = true;
+                break;
+            }
+            e.step(PointerInput { dx: 1.0, y, engaged: true }, 1.0 / 60.0);
+        }
+        assert!(released, "'a' should have become dominant under the crosshair");
+    }
+
+    #[test]
+    fn release_without_dominant_box_commits_nothing() {
+        let mut e = engine();
+        e.set_viewport_px(1000.0);
+        // Expand the root but never zoom: no box dominates the full-width view.
+        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        assert!(e.committed_syms().is_empty(), "a plain pause must not commit");
     }
 
     #[test]
