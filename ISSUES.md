@@ -1,0 +1,3 @@
+- Some times letters are typed twice in the text field. In the app the sentence is shown correctly but in the external application text field some letters show up twice. Has happened only when typing into web browser so that might be relevant but difficult to say.
+  - When typing into a terminal with the keyboard backtracking works fine and letters seem to not be typed twice. When typing to web browser DOM elements some letters are erased when moving backwards and others on the other hand are not.
+- Categories for capitals, symbols, and numbers need better indicator letters. The fact that upper case "A" is used for capitals is confusing and the same kind of issue applies for all the other categories. What could be good replacement for these?
