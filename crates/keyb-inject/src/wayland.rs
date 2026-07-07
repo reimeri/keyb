@@ -33,6 +33,12 @@ use crate::{Caps, Injector};
 const KEY_PRESSED: u32 = 1;
 const KEY_RELEASED: u32 = 0;
 
+const KEY_BACKSPACE: u32 = 14;
+const KEY_TAB: u32 = 15;
+const KEY_ENTER: u32 = 28;
+const KEY_SPACE: u32 = 57;
+const PINNED_KEYCODES: [u32; 4] = [KEY_BACKSPACE, KEY_TAB, KEY_ENTER, KEY_SPACE];
+
 struct State {
     /// Input method activation, double-buffered per protocol: activate /
     /// deactivate arrive between `done` events.
@@ -57,8 +63,10 @@ pub struct WaylandInjector {
     state: State,
     im: Option<ZwpInputMethodV2>,
     vk: Option<ZwpVirtualKeyboardV1>,
-    /// Symbol -> evdev keycode in our uploaded keymap.
+    /// Symbols in our uploaded keymap; `codes[i]` is the evdev keycode of
+    /// `chars[i]`.
     chars: Vec<char>,
+    codes: Vec<u32>,
     epoch: Instant,
     /// Keep the keymap fd alive for the lifetime of the virtual keyboard.
     _keymap_fd: Option<OwnedFd>,
@@ -158,19 +166,55 @@ impl Dispatch<ZwpInputMethodV2, ()> for State {
 fn keysym_name(c: char) -> String {
     match c {
         '\n' => "Return".into(),
+        '\t' => "Tab".into(),
         '\u{8}' => "BackSpace".into(),
         _ => format!("U{:04X}", c as u32),
     }
 }
 
+/// Canonical evdev keycode for keys that Chromium resolves by physical
+/// position instead of keysym (its editing/UI commands come from the
+/// keycode; a BackSpace or space keysym on an arbitrary code does nothing
+/// there — Chromium special-cases exactly enter, tab, space, backspace).
+/// Firefox and terminals honor the keysym alone; pinning costs them nothing.
+fn pinned_keycode(c: char) -> Option<u32> {
+    match c {
+        '\u{8}' => Some(KEY_BACKSPACE),
+        '\t' => Some(KEY_TAB),
+        '\n' => Some(KEY_ENTER),
+        ' ' => Some(KEY_SPACE),
+        _ => None,
+    }
+}
+
+/// Evdev keycode per symbol: pinned keys sit on their canonical codes,
+/// everything else fills sequentially from 1, skipping the pinned codes.
+fn assign_keycodes(chars: &[char]) -> Vec<u32> {
+    let mut next = 1u32;
+    chars
+        .iter()
+        .map(|&c| match pinned_keycode(c) {
+            Some(code) => code,
+            None => {
+                while PINNED_KEYCODES.contains(&next) {
+                    next += 1;
+                }
+                let code = next;
+                next += 1;
+                code
+            }
+        })
+        .collect()
+}
+
 /// Minimal xkb_v1 keymap: symbol `i` of `chars` lives on evdev keycode
-/// `i + 1` (xkb keycode `i + 9`).
-fn build_keymap(chars: &[char]) -> String {
-    let mut codes = String::new();
+/// `codes[i]` (xkb keycode `codes[i] + 8`).
+fn build_keymap(chars: &[char], codes: &[u32]) -> String {
+    let mut keycodes = String::new();
     let mut syms = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        let xkb = i + 9;
-        codes.push_str(&format!("        <K{i}> = {xkb};\n"));
+    for (i, (&c, &code)) in chars.iter().zip(codes).enumerate() {
+        let xkb = code + 8;
+        keycodes.push_str(&format!("        <K{i}> = {xkb};\n"));
         syms.push_str(&format!("        key <K{i}> {{ [ {} ] }};\n", keysym_name(c)));
     }
     format!(
@@ -178,7 +222,7 @@ fn build_keymap(chars: &[char]) -> String {
          xkb_keycodes \"keyb\" {{\n\
          \x20       minimum = 8;\n\
          \x20       maximum = {max};\n\
-         {codes}\
+         {keycodes}\
          }};\n\
          xkb_types \"keyb\" {{ include \"complete\" }};\n\
          xkb_compatibility \"keyb\" {{ include \"complete\" }};\n\
@@ -186,7 +230,7 @@ fn build_keymap(chars: &[char]) -> String {
          {syms}\
          }};\n\
          }};\n",
-        max = chars.len() + 9,
+        max = codes.iter().max().map_or(9, |m| m + 9),
     )
 }
 
@@ -240,12 +284,13 @@ impl WaylandInjector {
             chars.push('\u{8}');
         }
 
+        let codes = assign_keycodes(&chars);
         let im = im_manager.as_ref().map(|m| m.get_input_method(&seat, &qh, ()));
         let mut keymap_fd = None;
         let vk = match vk_manager.as_ref() {
             Some(m) => {
                 let vk = m.create_virtual_keyboard(&seat, &qh, ());
-                let keymap = build_keymap(&chars);
+                let keymap = build_keymap(&chars, &codes);
                 let fd = memfd_with(&keymap)?;
                 // +1: compositors expect the NUL in the mapped size.
                 vk.keymap(1, fd.as_fd(), keymap.len() as u32 + 1);
@@ -274,6 +319,7 @@ impl WaylandInjector {
             im,
             vk,
             chars,
+            codes,
             epoch: Instant::now(),
             _keymap_fd: keymap_fd,
         })
@@ -314,8 +360,8 @@ impl WaylandInjector {
             .chars
             .iter()
             .position(|&k| k == c)
-            .with_context(|| format!("{c:?} is not in the injection keymap"))? as u32
-            + 1;
+            .map(|i| self.codes[i])
+            .with_context(|| format!("{c:?} is not in the injection keymap"))?;
         let t = self.now_ms();
         vk.key(t, code, KEY_PRESSED);
         vk.key(t, code, KEY_RELEASED);
@@ -341,18 +387,20 @@ impl Injector for WaylandInjector {
 
     fn retract(&mut self, text: &str) -> Result<()> {
         self.pump()?;
-        // delete_surrounding_text only where the target proved it maintains
-        // surrounding text; terminals and other key-oriented clients ignore
-        // the deletion, so give them backspaces even while the IM is active.
-        if self.im_usable() && (self.state.im_surrounding || self.vk.is_none()) {
+        // BackSpace taps whenever the virtual keyboard exists: browsers
+        // (Chromium) silently drop delete_surrounding_text on many fields
+        // even after reporting surrounding text, and its commit serial can
+        // go stale mid-flight, while a key tap is never discarded. IM
+        // deletion remains only for compositors without virtual-keyboard-v1.
+        if self.vk.is_some() || !self.im_usable() {
+            for _ in text.chars() {
+                self.tap('\u{8}')?;
+            }
+        } else {
             self.settle_im()?;
             let im = self.im.as_ref().expect("im_usable checked");
             im.delete_surrounding_text(text.len() as u32, 0);
             im.commit(self.state.im_serial);
-        } else {
-            for _ in text.chars() {
-                self.tap('\u{8}')?;
-            }
         }
         self.pump()
     }
@@ -360,10 +408,12 @@ impl Injector for WaylandInjector {
     fn capabilities(&self) -> Caps {
         Caps {
             name: "wayland",
-            // Truthful only when an IM-activated field that reports
-            // surrounding text is focused; everything else is backspace
-            // synthesis.
-            true_retraction: self.im_usable() && self.state.im_surrounding,
+            // Truthful only on the no-vk fallback where retraction actually
+            // goes through delete_surrounding_text; with a virtual keyboard
+            // present, every retraction is backspace synthesis.
+            true_retraction: self.vk.is_none()
+                && self.im_usable()
+                && self.state.im_surrounding,
         }
     }
 }
@@ -375,11 +425,40 @@ mod tests {
     #[test]
     fn keymap_names_every_char() {
         let chars: Vec<char> = ('a'..='c').chain([' ', '\u{8}']).collect();
-        let km = build_keymap(&chars);
+        let km = build_keymap(&chars, &assign_keycodes(&chars));
         assert!(km.contains("<K0> = 9;"));
         assert!(km.contains("[ U0061 ]"));
         assert!(km.contains("[ U0020 ]"));
         assert!(km.contains("[ BackSpace ]"));
-        assert!(km.contains("maximum = 14;"));
+        assert!(km.contains("maximum = 66;"), "headroom above xkb 65 (space)");
+    }
+
+    #[test]
+    fn special_keys_sit_on_canonical_keycodes() {
+        // Chromium maps enter/tab/space/backspace by physical keycode, not
+        // keysym; they must sit where a real keyboard puts them.
+        let chars = vec!['a', '\n', 'b', '\u{8}', ' ', 'c'];
+        let codes = assign_keycodes(&chars);
+        assert_eq!(codes, vec![1, KEY_ENTER, 2, KEY_BACKSPACE, KEY_SPACE, 3]);
+        let km = build_keymap(&chars, &codes);
+        assert!(km.contains("<K1> = 36;")); // Return at xkb 28+8
+        assert!(km.contains("key <K1> { [ Return ] };"));
+        assert!(km.contains("<K3> = 22;")); // BackSpace at xkb 14+8
+        assert!(km.contains("key <K3> { [ BackSpace ] };"));
+        assert!(km.contains("<K4> = 65;")); // space at xkb 57+8
+        assert!(km.contains("key <K4> { [ U0020 ] };"));
+    }
+
+    #[test]
+    fn sequential_codes_skip_pinned_positions() {
+        // Enough printables to walk past both reserved codes.
+        let chars: Vec<char> = ('a'..='z').chain(['\u{8}', '\n']).collect();
+        let codes = assign_keycodes(&chars);
+        assert_eq!(codes.iter().filter(|&&c| c == KEY_BACKSPACE).count(), 1);
+        assert_eq!(codes.iter().filter(|&&c| c == KEY_ENTER).count(), 1);
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "no keycode collisions");
     }
 }
