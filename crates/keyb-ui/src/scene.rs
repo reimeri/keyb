@@ -122,7 +122,7 @@ pub fn build(
             continue;
         }
         let (adv, label) = if h >= LABEL_MIN_PX {
-            let text = b.label.to_string();
+            let text = box_label_text(b.group, b.label, fonts);
             let font_px = (h * 0.55).clamp(13.0, 64.0) as f32;
             let (glyphs, adv) = fonts.layout(&text, font_px);
             let baseline = (y0 + y1) / 2.0 + font_px as f64 * 0.35;
@@ -164,18 +164,33 @@ pub fn build(
     for (_, _, d) in draws {
         let radius = (d.h * 0.15).min(10.0);
         let rect = RoundedRect::new(d.x0, d.cy0, lw, d.cy1, radius);
-        let fill_color = match d.group {
-            Some(g) => group_color(g, d.depth, d.on_path),
-            None => box_color(d.sym, d.depth, d.on_path),
-        };
-        scene.fill(Fill::NonZero, t, fill_color, None, &rect);
-        // Crosshair-path boxes (what will be written) get a bright edge.
-        let (stroke_c, stroke_w) = if d.on_path {
-            (Color::from_rgba8(0xFF, 0xFF, 0xFF, 150), 1.6)
-        } else {
-            (Color::from_rgba8(0, 0, 0, 60), 1.0)
-        };
-        scene.stroke(&Stroke::new(stroke_w), t, stroke_c, None, &rect);
+        match d.group {
+            // Group boxes read as *containers*, not writable leaves: a hollow
+            // interior (faint category tint) ringed by a bright category-colored
+            // border. Enclosed leaves draw on top, so the box reads as "a set of
+            // these" rather than a single character you could type.
+            Some(g) => {
+                let c = group_color(g, d.depth, d.on_path);
+                scene.fill(Fill::NonZero, t, c.with_alpha(0.16), None, &rect);
+                let (stroke_c, stroke_w) = if d.on_path {
+                    (Color::from_rgba8(0xFF, 0xFF, 0xFF, 190), 2.4)
+                } else {
+                    (c, 2.0)
+                };
+                scene.stroke(&Stroke::new(stroke_w), t, stroke_c, None, &rect);
+            }
+            None => {
+                let fill_color = box_color(d.sym, d.depth, d.on_path);
+                scene.fill(Fill::NonZero, t, fill_color, None, &rect);
+                // Crosshair-path boxes (what will be written) get a bright edge.
+                let (stroke_c, stroke_w) = if d.on_path {
+                    (Color::from_rgba8(0xFF, 0xFF, 0xFF, 150), 1.6)
+                } else {
+                    (Color::from_rgba8(0, 0, 0, 60), 1.0)
+                };
+                scene.stroke(&Stroke::new(stroke_w), t, stroke_c, None, &rect);
+            }
+        }
 
         if let Some((glyphs, font_px, baseline)) = d.label {
             scene
@@ -357,6 +372,19 @@ pub fn build_handle(scene: &mut Scene, fonts: &FontAssets, lw: f64, lh: f64, sca
         )))
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
+}
+
+/// Display mark for a box. Leaf boxes show their own character; group boxes get
+/// a short, non-typeable mark so they're never mistaken for a letter you could
+/// write (ISSUES.md): capitals a shift arrow (⇧), digits and symbols a bracketed
+/// exemplar ("[1]", "[!]") whose brackets read as "a set of these". Falls back to
+/// a bracketed letter where the system font lacks the shift glyph.
+fn box_label_text(group: Option<GroupColor>, ch: char, fonts: &FontAssets) -> String {
+    match group {
+        Some(GroupColor::Capitals) if fonts.has_glyph('\u{21E7}') => "\u{21E7}".to_string(),
+        Some(_) => format!("[{ch}]"),
+        None => ch.to_string(),
+    }
 }
 
 /// Golden-angle hue per symbol so neighbors in the column differ clearly;
