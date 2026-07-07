@@ -649,9 +649,14 @@ impl Engine {
         let mut kids = Vec::with_capacity(items.len());
         for (i, &item) in items.iter().enumerate() {
             if i == k {
-                // Transplant the current tree into the descended slot; its root
-                // already carries the correct label/opens (copied on descent).
+                // Transplant the current tree into the descended slot. The old
+                // root's label is a placeholder when it was created by a climb
+                // (a climb root's identity lives one ledger level up), so
+                // restamp label/opens from the authoritative layout item.
                 let idx = copy_subtree(&self.nodes, ROOT, &mut dst, ROOT, 1, c_lo, cw);
+                let (label, c_opens) = label_and_opens(&self.alphabet, item);
+                dst[idx].label = label;
+                dst[idx].opens = c_opens;
                 dst[idx].lo = c_lo;
                 dst[idx].hi = c_hi;
                 kids.push(idx);
@@ -1717,6 +1722,63 @@ mod tests {
         assert!(e.committed_syms().is_empty(), "full retraction");
         assert!(e.ledger.is_empty(), "frame back at document root");
         assert_eq!(e.frame_chars, 0);
+    }
+
+    /// Backtracking to the document start must restore the tree's labels, not
+    /// just its geometry. Regression: climb-out used to transplant the old
+    /// frame root without restamping its label, so every spine node of the
+    /// undone path (including the capitals group box) rendered as the
+    /// placeholder symbol 0 ('a') and re-committed the wrong characters.
+    #[test]
+    fn climb_out_restores_labels_after_grouped_backtrack() {
+        let mut e = full_engine();
+        // Force frame advances so backtracking has many levels to climb out of.
+        e.params.rebase_view_w = 0.5;
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        let target = e.alphabet.encode("I have");
+        assert!(steer_to(&mut e, &target, 40000), "should write 'I have'");
+        assert!(!e.ledger.is_empty(), "frame should have advanced");
+        for _ in 0..40000 {
+            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            if e.committed_syms().is_empty() && e.ledger.is_empty() {
+                break;
+            }
+        }
+        assert!(e.committed_syms().is_empty(), "full retraction");
+        assert!(e.ledger.is_empty(), "frame back at document root");
+        // Every child's label/opens must match its slot in the parent layout.
+        for i in 0..e.nodes.len() {
+            if !e.nodes[i].alive || !e.nodes[i].expanded {
+                continue;
+            }
+            let items = e.alphabet.items(e.nodes[i].opens).to_vec();
+            for (k, &c) in e.nodes[i].children.iter().enumerate() {
+                let (label, opens) = label_and_opens(&e.alphabet, items[k]);
+                assert_eq!(e.nodes[c].opens, opens, "node {c} opens wrong layout");
+                let ok = matches!(
+                    (label, e.nodes[c].label),
+                    (NodeLabel::Char(a), NodeLabel::Char(b)) if a == b
+                ) || matches!(
+                    (label, e.nodes[c].label),
+                    (NodeLabel::Group(a), NodeLabel::Group(b)) if a == b
+                );
+                assert!(
+                    ok,
+                    "node {c} label {:?} does not match layout item {label:?}",
+                    e.nodes[c].label
+                );
+            }
+        }
+        // The capitals group box is back where it belongs, not a phantom 'a'.
+        let boxes = e.visible();
+        assert!(
+            boxes.iter().any(|b| b.group == Some(GroupColor::Capitals)),
+            "capitals group box must be visible again at the root"
+        );
+        // Moving forward again replays the exact same text.
+        assert!(steer_to(&mut e, &target, 40000), "retype after backtrack");
+        assert_eq!(e.committed_text(), "I have");
     }
 
     /// The visible set marks group boxes with a color and their label, and
