@@ -42,7 +42,7 @@ Status: draft v1 · Target platform: Linux desktop first (Wayland + X11), Window
 | 2D rendering | **vello** (wgpu-based compute rasterizer) | The UI is thousands of nested rectangles and text glyphs under continuous zoom; vello renders resolution-independent vector scenes on the GPU with crisp text at any scale. |
 | Text shaping/layout | **parley + swash** | Vello's companion stack; proper shaping, font fallback, subpixel-quality glyph rendering across zoom levels. |
 | LLM inference | **llama.cpp** via the `llama-cpp-2` crate | GGUF models, CPU-first with optional Vulkan/CUDA offload, mature KV-cache API with **sequence branching** (needed for tree caches, §6.5). |
-| Default model | **Qwen2.5-0.5B-Instruct, Q4_K_M GGUF** (~400 MB) | Sub-50 ms per forward pass on a mid-range CPU; far below chat quality bar but far above the entropy bar needed for box sizing. Swappable via config; SmolLM2-360M as low-end alternative. |
+| Default model | **Qwen2.5-0.5B-Instruct, Q4_K_M GGUF** (~491 MB) | Sub-50 ms per forward pass on a mid-range CPU; far below chat quality bar but far above the entropy bar needed for box sizing. Swappable via config; SmolLM2-360M as low-end alternative. |
 | Fallback char model | Order-4 **PPM** trained on user history + seed corpus, in-crate | Smoothing floor and offline/degraded mode; tiny and instant. |
 | Text injection | Wayland `zwp_virtual_keyboard_v1` + `zwp_input_method_v2`; X11 XTEST (via `x11rb`); `wl_data_device`/clipboard as universal fallback | See §8. |
 | Config/persistence | TOML via `serde` + `toml`; user data under `$XDG_DATA_HOME/keyb/` | Boring and inspectable. |
@@ -364,6 +364,15 @@ M3 findings (from the foot-under-headless-sway harness, §11):
 
 - `$XDG_CONFIG_HOME/keyb/config.toml` — model path, threads, speed, alphabet,
   injection preferences, novice mode.
+- On first launch, the app downloads the default Qwen2.5-0.5B-Instruct
+  Q4_K_M GGUF from the official Apache-2.0-licensed
+  `Qwen/Qwen2.5-0.5B-Instruct-GGUF` repository. The revision, expected size,
+  and SHA-256 are pinned in `keyb-app`; downloads are resumable and are only
+  published after verification. The current artifact is 491,400,032 bytes with
+  SHA-256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`.
+  `KEYB_NO_MODEL_DOWNLOAD=1` disables automatic provisioning.
+  `KEYB_MODEL=/path/to/model.gguf` selects a user-managed model and never
+  triggers a download to that path.
 - `$XDG_DATA_HOME/keyb/` — PPM user history (plain text, user-deletable; **an
   explicit privacy toggle disables history entirely**, and password-type fields
   can't be detected reliably so the toggle is surfaced in the main UI, not buried),

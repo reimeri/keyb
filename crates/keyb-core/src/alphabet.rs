@@ -110,7 +110,13 @@ impl Alphabet {
         leaves.push(' ');
         leaves.extend(['.', ',', '\'']);
         let n = leaves.len() as u8;
-        Alphabet::from_spec(leaves, &LayoutSpec { top_leaves: 0..n, groups: Vec::new() })
+        Alphabet::from_spec(
+            leaves,
+            &LayoutSpec {
+                top_leaves: 0..n,
+                groups: Vec::new(),
+            },
+        )
     }
 
     /// Full English alphabet for interactive use: the v1 leaves (identical
@@ -141,9 +147,21 @@ impl Alphabet {
         let spec = LayoutSpec {
             top_leaves: 0..top_end,
             groups: vec![
-                GroupSpec { label: 'A', color: GroupColor::Capitals, leaves: caps_start..caps_end },
-                GroupSpec { label: '1', color: GroupColor::Digits, leaves: digits_start..digits_end },
-                GroupSpec { label: '!', color: GroupColor::Symbols, leaves: sym_start..sym_end },
+                GroupSpec {
+                    label: 'A',
+                    color: GroupColor::Capitals,
+                    leaves: caps_start..caps_end,
+                },
+                GroupSpec {
+                    label: '1',
+                    color: GroupColor::Digits,
+                    leaves: digits_start..digits_end,
+                },
+                GroupSpec {
+                    label: '!',
+                    color: GroupColor::Symbols,
+                    leaves: sym_start..sym_end,
+                },
             ],
         };
         Alphabet::from_spec(leaves, &spec)
@@ -171,7 +189,10 @@ impl Alphabet {
                 }
             }
         }
-        LayoutSpec { top_leaves: 0..top_end, groups }
+        LayoutSpec {
+            top_leaves: 0..top_end,
+            groups,
+        }
     }
 
     fn from_spec(leaves: Vec<char>, spec: &LayoutSpec) -> Self {
@@ -223,7 +244,11 @@ impl Alphabet {
         }
         // ~2% of the parent interval per group — a ~15 px box on a typical
         // column that grows as you steer toward it, rather than a 3 px sliver.
-        Alphabet { leaves, layout: Layout { nodes }, group_prior: 0.02 }
+        Alphabet {
+            leaves,
+            layout: Layout { nodes },
+            group_prior: 0.02,
+        }
     }
 
     /// Override the per-group minimum size (SPEC §5.4). 0 disables it.
@@ -308,8 +333,11 @@ impl Alphabet {
             .map(|item| match *item {
                 Item::Leaf(s) => dist[s as usize],
                 Item::Group(g) => {
-                    let mass: f64 =
-                        self.layout.nodes[g as usize].leaves.iter().map(|&l| dist[l as usize]).sum();
+                    let mass: f64 = self.layout.nodes[g as usize]
+                        .leaves
+                        .iter()
+                        .map(|&l| dist[l as usize])
+                        .sum();
                     mass.max(self.group_prior)
                 }
             })
@@ -327,7 +355,9 @@ impl Alphabet {
     }
 
     pub(crate) fn group_color(&self, gid: u32) -> GroupColor {
-        self.layout.nodes[gid as usize].color.unwrap_or(GroupColor::Symbols)
+        self.layout.nodes[gid as usize]
+            .color
+            .unwrap_or(GroupColor::Symbols)
     }
 }
 
@@ -397,10 +427,16 @@ mod tests {
     #[test]
     fn encode_preserves_case_when_available() {
         let full = Alphabet::english_full();
-        assert_eq!(full.encode("Ab"), vec![full.index_of('A').unwrap(), full.index_of('b').unwrap()]);
+        assert_eq!(
+            full.encode("Ab"),
+            vec![full.index_of('A').unwrap(), full.index_of('b').unwrap()]
+        );
         // Lowercase-only alphabet folds capitals down.
         let v1 = Alphabet::english_v1();
-        assert_eq!(v1.encode("Ab"), vec![v1.index_of('a').unwrap(), v1.index_of('b').unwrap()]);
+        assert_eq!(
+            v1.encode("Ab"),
+            vec![v1.index_of('a').unwrap(), v1.index_of('b').unwrap()]
+        );
     }
 
     #[test]
@@ -409,7 +445,10 @@ mod tests {
         let b = a.clone();
         assert_eq!(a.len(), b.len());
         let da = vec![1.0 / a.len() as f64; a.len()];
-        assert_eq!(a.item_weights(a.root_layout(), &da), b.item_weights(b.root_layout(), &da));
+        assert_eq!(
+            a.item_weights(a.root_layout(), &da),
+            b.item_weights(b.root_layout(), &da)
+        );
         let s = a.index_of('7').unwrap();
         assert_eq!(a.item_leading_to(0, s), b.item_leading_to(0, s));
     }

@@ -132,7 +132,16 @@ impl Core {
             (self.sink)(ev);
         }
 
-        scene::build(&mut self.scene, &self.engine, &self.fonts, lw, lh, scale, input, self.cursor);
+        scene::build(
+            &mut self.scene,
+            &self.engine,
+            &self.fonts,
+            lw,
+            lh,
+            scale,
+            input,
+            self.cursor,
+        );
     }
 }
 
@@ -144,11 +153,15 @@ pub(crate) struct Gpu {
 
 impl Gpu {
     pub fn new() -> Self {
-        Gpu { context: RenderContext::new(), renderers: Vec::new() }
+        Gpu {
+            context: RenderContext::new(),
+            renderers: Vec::new(),
+        }
     }
 
     pub fn ensure_renderer(&mut self, dev_id: usize, format: vello::wgpu::TextureFormat) {
-        self.renderers.resize_with(self.context.devices.len().max(dev_id + 1), || None);
+        self.renderers
+            .resize_with(self.context.devices.len().max(dev_id + 1), || None);
         self.renderers[dev_id].get_or_insert_with(|| {
             Renderer::new(
                 &self.context.devices[dev_id].device,

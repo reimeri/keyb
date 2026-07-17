@@ -74,7 +74,10 @@ impl Rng {
 
 pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64) -> OracleResult {
     let target_syms = engine.alphabet.encode(target);
-    assert!(!target_syms.is_empty(), "target text is empty after encoding");
+    assert!(
+        !target_syms.is_empty(),
+        "target text is empty after encoding"
+    );
     let mut rng = Rng(seed | 1);
     let mut delay_line: Vec<PointerInput> = Vec::new();
     let mut t = 0.0f64;
@@ -95,7 +98,11 @@ pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64
         let intent = if !target_syms.starts_with(&committed) {
             // Wrote something wrong (noise) — back out until the prefix matches.
             revealing = false;
-            PointerInput { dx: -1.0, y: 0.5, engaged: true }
+            PointerInput {
+                dx: -1.0,
+                y: 0.5,
+                engaged: true,
+            }
         } else {
             let remaining = &target_syms[committed.len()..];
             let depth = p.lookahead.min(remaining.len());
@@ -118,9 +125,17 @@ pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64
             if revealing {
                 // Point at the edge nearest the target: the vertical pan
                 // pulls it into view while a gentle zoom-out widens the view.
-                PointerInput { dx: -0.3, y: y_des.clamp(0.0, 1.0), engaged: true }
+                PointerInput {
+                    dx: -0.3,
+                    y: y_des.clamp(0.0, 1.0),
+                    engaged: true,
+                }
             } else {
-                PointerInput { dx: 1.0, y: y_des, engaged: true }
+                PointerInput {
+                    dx: 1.0,
+                    y: y_des,
+                    engaged: true,
+                }
             }
         };
 
@@ -150,6 +165,10 @@ pub fn run_oracle(engine: &mut Engine, target: &str, p: &OracleParams, seed: u64
         completed,
         chars,
         secs: t,
-        wpm: if minutes > 0.0 { (chars as f64 / 5.0) / minutes } else { 0.0 },
+        wpm: if minutes > 0.0 {
+            (chars as f64 / 5.0) / minutes
+        } else {
+            0.0
+        },
     }
 }

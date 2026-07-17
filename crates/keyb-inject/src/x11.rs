@@ -69,7 +69,12 @@ impl XtestInjector {
             .get(&KEYSYM_SHIFT_L)
             .map(|&(kc, _)| kc)
             .context("layout has no Shift_L")?;
-        Ok(XtestInjector { conn, root, keycodes, shift })
+        Ok(XtestInjector {
+            conn,
+            root,
+            keycodes,
+            shift,
+        })
     }
 
     fn tap(&self, c: char) -> Result<()> {
@@ -115,6 +120,9 @@ impl Injector for XtestInjector {
     }
 
     fn capabilities(&self) -> Caps {
-        Caps { name: "x11-xtest", true_retraction: false }
+        Caps {
+            name: "x11-xtest",
+            true_retraction: false,
+        }
     }
 }

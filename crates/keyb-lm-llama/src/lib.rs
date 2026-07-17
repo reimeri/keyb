@@ -36,8 +36,8 @@ impl Default for LlamaConfig {
     fn default() -> Self {
         LlamaConfig {
             model_path: default_model_path(),
-            n_threads: (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2)
-                .clamp(2, 8) as i32,
+            n_threads: (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).clamp(2, 8)
+                as i32,
             n_ctx: 4096,
             max_branches: 32,
             lambda: 0.05,
@@ -147,7 +147,9 @@ impl LanguageModel for LlamaLm {
             return d.clone();
         }
         if self.pending.insert(context.to_vec()) {
-            self.send(ToWorker::Predict { ctx: context.to_vec() });
+            self.send(ToWorker::Predict {
+                ctx: context.to_vec(),
+            });
         }
         // Deadline missed by definition (nothing cached): PPM alone (§6.3).
         self.ppm.predict(context)
@@ -175,12 +177,16 @@ impl LanguageModel for LlamaLm {
             return;
         }
         self.last_hint = Some(center_context.to_vec());
-        self.send(ToWorker::Hint { ctx: center_context.to_vec() });
+        self.send(ToWorker::Hint {
+            ctx: center_context.to_vec(),
+        });
     }
 
     fn release(&mut self, context: &[u8]) {
         if self.pending.remove(context) {
-            self.send(ToWorker::Cancel { ctx: context.to_vec() });
+            self.send(ToWorker::Cancel {
+                ctx: context.to_vec(),
+            });
         }
     }
 

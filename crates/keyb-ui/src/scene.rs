@@ -301,10 +301,12 @@ pub fn build(
     scene
         .draw_glyphs(&fonts.font)
         .font_size(x_px)
-        .transform(t * Affine::translate((
-            btn.center().x - adv as f64 / 2.0,
-            btn.center().y + x_px as f64 * 0.35,
-        )))
+        .transform(
+            t * Affine::translate((
+                btn.center().x - adv as f64 / 2.0,
+                btn.center().y + x_px as f64 * 0.35,
+            )),
+        )
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
 
@@ -321,21 +323,30 @@ pub fn build(
         &RoundedRect::from_rect(btn, 6.0),
     );
     let r_px = (btn.height() * 0.72) as f32;
-    let label = if fonts.has_glyph('\u{21BA}') { "\u{21BA}" } else { "R" };
+    let label = if fonts.has_glyph('\u{21BA}') {
+        "\u{21BA}"
+    } else {
+        "R"
+    };
     let (glyphs, adv) = fonts.layout(label, r_px);
     scene
         .draw_glyphs(&fonts.font)
         .font_size(r_px)
-        .transform(t * Affine::translate((
-            btn.center().x - adv as f64 / 2.0,
-            btn.center().y + r_px as f64 * 0.35,
-        )))
+        .transform(
+            t * Affine::translate((
+                btn.center().x - adv as f64 / 2.0,
+                btn.center().y + r_px as f64 * 0.35,
+            )),
+        )
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
 
     // Speed readout, bottom-left.
     let (glyphs, _) = fonts.layout(
-        &format!("speed {:.1} bits per s   plus and minus adjust", engine.speed_bits),
+        &format!(
+            "speed {:.1} bits per s   plus and minus adjust",
+            engine.speed_bits
+        ),
         13.0,
     );
     scene
@@ -366,10 +377,12 @@ pub fn build_handle(scene: &mut Scene, fonts: &FontAssets, lw: f64, lh: f64, sca
     scene
         .draw_glyphs(&fonts.font)
         .font_size(font_px)
-        .transform(t * Affine::translate((
-            lw / 2.0 - adv as f64 / 2.0,
-            lh / 2.0 + font_px as f64 * 0.35,
-        )))
+        .transform(
+            t * Affine::translate((
+                lw / 2.0 - adv as f64 / 2.0,
+                lh / 2.0 + font_px as f64 * 0.35,
+            )),
+        )
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
 }
@@ -392,7 +405,11 @@ fn box_label_text(group: Option<GroupColor>, ch: char, fonts: &FontAssets) -> St
 /// crosshair path are lifted slightly so the pending text reads on canvas.
 fn box_color(sym: u8, depth: usize, on_path: bool) -> Color {
     let hue = (sym as f64 * 137.508) % 360.0;
-    let (s, mut l) = if depth % 2 == 0 { (0.42, 0.30) } else { (0.40, 0.38) };
+    let (s, mut l) = if depth % 2 == 0 {
+        (0.42, 0.30)
+    } else {
+        (0.40, 0.38)
+    };
     if on_path {
         l += 0.07;
     }
@@ -486,7 +503,10 @@ mod tests {
             (2, 1, 30.0, 20.0, true),            // small child
         ];
         let x0 = box_left_edges(&boxes, LW);
-        assert!((x0[0] - (LW - 200.0 * 1.1)).abs() < 1e-6, "parent stays nominal");
+        assert!(
+            (x0[0] - (LW - 200.0 * 1.1)).abs() < 1e-6,
+            "parent stays nominal"
+        );
     }
 
     /// Left edges never cross the canvas cap even for a deep near-full chain.

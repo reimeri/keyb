@@ -412,8 +412,8 @@ impl Engine {
         let jitter = (input.y - self.prev_y).abs() > 0.25;
         let reversed = self.prev_dx_sign != 0 && dx_sign != 0 && dx_sign != self.prev_dx_sign;
         if jitter || reversed {
-            self.speed_bits = (self.speed_bits * self.params.speed_drop)
-                .max(self.params.min_bits_per_sec);
+            self.speed_bits =
+                (self.speed_bits * self.params.speed_drop).max(self.params.min_bits_per_sec);
         } else if dx_sign > 0 {
             let grow = (1.0 + self.params.speed_rise_per_sec * dt).powf(1.0);
             self.speed_bits = (self.speed_bits * grow).min(self.params.max_bits_per_sec);
@@ -433,7 +433,9 @@ impl Engine {
     fn apply_upgrades(&mut self) {
         for (ctx, dist) in self.lm.poll_upgrades() {
             debug_assert_eq!(dist.len(), self.alphabet.len());
-            let Some(p) = self.node_for_context(&ctx) else { continue };
+            let Some(p) = self.node_for_context(&ctx) else {
+                continue;
+            };
             let mut stack = vec![p];
             while let Some(n) = stack.pop() {
                 self.repartition_node(n, &dist);
@@ -715,8 +717,7 @@ impl Engine {
         }
         // The shallowest root child the whole view sits inside.
         let opens = self.nodes[ROOT].opens;
-        let Some((k, &child)) = self
-            .nodes[ROOT]
+        let Some((k, &child)) = self.nodes[ROOT]
             .children
             .iter()
             .enumerate()
@@ -840,7 +841,11 @@ impl Engine {
         for (k, &item) in items.iter().enumerate() {
             let c_lo = cursor;
             // Last child absorbs rounding so children exactly partition [lo,hi).
-            let c_hi = if k + 1 == items.len() { hi } else { cursor + weights[k] / total * w };
+            let c_hi = if k + 1 == items.len() {
+                hi
+            } else {
+                cursor + weights[k] / total * w
+            };
             cursor = c_hi;
             let (label, c_opens) = label_and_opens(&self.alphabet, item);
             children.push(self.nodes.len());
@@ -1159,9 +1164,11 @@ impl Engine {
             .map(|(i, n)| {
                 let (sym, label, group) = match n.label {
                     NodeLabel::Char(s) => (s, self.alphabet.label(s), None),
-                    NodeLabel::Group(g) => {
-                        (0, self.alphabet.group_label(g), Some(self.alphabet.group_color(g)))
-                    }
+                    NodeLabel::Group(g) => (
+                        0,
+                        self.alphabet.group_label(g),
+                        Some(self.alphabet.group_color(g)),
+                    ),
                 };
                 BoxView {
                     sym,
@@ -1226,7 +1233,11 @@ mod tests {
             }
             let committed = e.committed_syms().to_vec();
             let input = if !target.starts_with(&committed) {
-                PointerInput { dx: -1.0, y: 0.5, engaged: true }
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                }
             } else {
                 let rest = &target[committed.len()..];
                 let depth = rest.len().min(4);
@@ -1234,9 +1245,17 @@ mod tests {
                 let (v_lo, v_hi) = e.view();
                 let y = ((lo + hi) / 2.0 - v_lo) / (v_hi - v_lo);
                 if (0.0..=1.0).contains(&y) {
-                    PointerInput { dx: 1.0, y, engaged: true }
+                    PointerInput {
+                        dx: 1.0,
+                        y,
+                        engaged: true,
+                    }
                 } else {
-                    PointerInput { dx: -0.3, y: y.clamp(0.0, 1.0), engaged: true }
+                    PointerInput {
+                        dx: -0.3,
+                        y: y.clamp(0.0, 1.0),
+                        engaged: true,
+                    }
                 }
             };
             e.step(input, 1.0 / 60.0);
@@ -1248,7 +1267,14 @@ mod tests {
     fn children_partition_parent() {
         let mut e = engine();
         e.set_viewport_px(1000.0);
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
         let root = &e.nodes[ROOT];
         assert!(root.expanded);
         let mut cursor = 0.0;
@@ -1268,12 +1294,22 @@ mod tests {
         assert!(steer_to(&mut e, &[0], 600), "should commit 'a'");
         // Now zoom straight out; the commit must retract.
         for _ in 0..600 {
-            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
             if e.committed_syms().is_empty() {
                 break;
             }
         }
-        assert!(e.committed_syms().is_empty(), "retraction should undo commit");
+        assert!(
+            e.committed_syms().is_empty(),
+            "retraction should undo commit"
+        );
     }
 
     #[test]
@@ -1284,21 +1320,33 @@ mod tests {
         assert!(steer_to(&mut e, &[0], 600), "should commit 'a'");
         let evs = e.drain_text_events();
         assert!(
-            evs.iter().any(|ev| matches!(ev, TextEvent::Commit(s) if s.contains('a'))),
+            evs.iter()
+                .any(|ev| matches!(ev, TextEvent::Commit(s) if s.contains('a'))),
             "commit must emit an event: {evs:?}"
         );
         for _ in 0..600 {
-            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
             if e.committed_syms().is_empty() {
                 break;
             }
         }
         let evs = e.drain_text_events();
         assert!(
-            evs.iter().any(|ev| matches!(ev, TextEvent::Retract(s) if s == "a")),
+            evs.iter()
+                .any(|ev| matches!(ev, TextEvent::Retract(s) if s == "a")),
             "retraction must emit an event: {evs:?}"
         );
-        assert!(e.drain_text_events().is_empty(), "drain must clear the queue");
+        assert!(
+            e.drain_text_events().is_empty(),
+            "drain must clear the queue"
+        );
     }
 
     #[test]
@@ -1311,7 +1359,14 @@ mod tests {
             let mut y = 0.3;
             for i in 0..2000 {
                 y = 0.5 + 0.45 * ((i as f64) * 0.013).sin();
-                e.step(PointerInput { dx: 0.9, y, engaged: true }, 1.0 / 60.0);
+                e.step(
+                    PointerInput {
+                        dx: 0.9,
+                        y,
+                        engaged: true,
+                    },
+                    1.0 / 60.0,
+                );
                 trace.push(e.view());
             }
             let _ = y;
@@ -1325,7 +1380,14 @@ mod tests {
         let mut e = engine();
         e.set_viewport_px(800.0);
         for _ in 0..1000 {
-            e.step(PointerInput { dx: -1.0, y: 0.1, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.1,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
         }
         let (lo, hi) = e.view();
         assert!(lo >= -1e-9 && hi <= 1.0 + 1e-9 && hi > lo);
@@ -1337,16 +1399,33 @@ mod tests {
         e.set_viewport_px(800.0);
         // Zoom in around the center so there is room to pan.
         for _ in 0..120 {
-            e.step(PointerInput { dx: 0.8, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: 0.8,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
         }
         let (lo0, hi0) = e.view();
         let (c0, w0) = ((lo0 + hi0) / 2.0, hi0 - lo0);
         for _ in 0..60 {
-            e.step(PointerInput { dx: 0.0, y: 0.1, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.1,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
         }
         let (lo1, hi1) = e.view();
         let c1 = (lo1 + hi1) / 2.0;
-        assert!(c1 < c0 - 0.1 * w0, "pointing up must scroll up: {c0} -> {c1}");
+        assert!(
+            c1 < c0 - 0.1 * w0,
+            "pointing up must scroll up: {c0} -> {c1}"
+        );
         assert!(
             ((hi1 - lo1) - w0).abs() < w0 * 1e-9,
             "dx=0 must not zoom: {w0} -> {}",
@@ -1363,23 +1442,48 @@ mod tests {
         e.set_viewport_px(1000.0);
         e.speed_bits = 8.0;
         // Capture the document root partition before anything moves.
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
-        let cuts0: Vec<f64> = e.nodes[ROOT].children.iter().map(|&c| e.nodes[c].lo).collect();
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
+        let cuts0: Vec<f64> = e.nodes[ROOT]
+            .children
+            .iter()
+            .map(|&c| e.nodes[c].lo)
+            .collect();
 
         let target = [1u8, 0, 2]; // "bac"
         assert!(steer_to(&mut e, &target, 3000), "should write the target");
-        assert!(!e.ledger.is_empty(), "low rebase threshold must advance the frame");
+        assert!(
+            !e.ledger.is_empty(),
+            "low rebase threshold must advance the frame"
+        );
 
         // Zoom all the way back out; text retracts and frames climb.
         for _ in 0..3000 {
-            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
             if e.committed_syms().is_empty() && e.ledger.is_empty() {
                 break;
             }
         }
         assert!(e.committed_syms().is_empty(), "full retraction");
         assert!(e.ledger.is_empty(), "frame back at document root");
-        let cuts1: Vec<f64> = e.nodes[ROOT].children.iter().map(|&c| e.nodes[c].lo).collect();
+        let cuts1: Vec<f64> = e.nodes[ROOT]
+            .children
+            .iter()
+            .map(|&c| e.nodes[c].lo)
+            .collect();
         assert_eq!(cuts0, cuts1, "climb-out must restore geometry exactly");
     }
 
@@ -1402,7 +1506,11 @@ mod tests {
             if self.polls < 2 {
                 return Vec::new();
             }
-            self.upgrade.take().map(|d| (Vec::new(), d)).into_iter().collect()
+            self.upgrade
+                .take()
+                .map(|d| (Vec::new(), d))
+                .into_iter()
+                .collect()
         }
 
         fn alphabet_len(&self) -> usize {
@@ -1417,21 +1525,49 @@ mod tests {
         // Upgrade: symbol 0 gets half the mass, rest uniform.
         let mut target = vec![0.5 / (n - 1) as f64; n];
         target[0] = 0.5;
-        let lm = UpgradingModel { n, polls: 0, upgrade: Some(target.clone()) };
+        let lm = UpgradingModel {
+            n,
+            polls: 0,
+            upgrade: Some(target.clone()),
+        };
         let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
         e.set_viewport_px(1000.0);
         // Step 1 expands the root with uniform sizing; step 2 receives the
         // upgrade and starts animating.
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
         let w_uniform = 1.0 / n as f64;
         let first = e.nodes[ROOT].children[0];
         let w0 = e.nodes[first].hi - e.nodes[first].lo;
-        assert!(w0 > w_uniform, "child 0 must start growing immediately: {w0}");
+        assert!(
+            w0 > w_uniform,
+            "child 0 must start growing immediately: {w0}"
+        );
         assert!(w0 < 0.5, "growth must be gradual, not a pop: {w0}");
         // Partition invariant must hold on every animation frame.
         for _ in 0..30 {
-            e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: false,
+                },
+                1.0 / 60.0,
+            );
             let mut cursor = 0.0;
             for &c in &e.nodes[ROOT].children {
                 assert!((e.nodes[c].lo - cursor).abs() < 1e-12);
@@ -1441,7 +1577,10 @@ mod tests {
         }
         // ~0.5 s later the animation must have converged to the target.
         let w1 = e.nodes[first].hi - e.nodes[first].lo;
-        assert!((w1 - 0.5).abs() < 1e-6, "must converge to upgraded size: {w1}");
+        assert!(
+            (w1 - 0.5).abs() < 1e-6,
+            "must converge to upgraded size: {w1}"
+        );
         assert!(e.nodes[ROOT].anim_target.is_none(), "animation must finish");
     }
 
@@ -1466,23 +1605,48 @@ mod tests {
                     && n.hi - n.lo >= e.params.commit_release_frac * w
                     && !(n.lo <= v_lo && n.hi >= v_hi)
             });
-            assert!(e.committed_syms().is_empty(), "must not auto-commit before dominance");
+            assert!(
+                e.committed_syms().is_empty(),
+                "must not auto-commit before dominance"
+            );
             if dominant {
                 // Let go: the dominant letter must commit even though it never
                 // fully engulfed the view.
-                e.step(PointerInput { dx: 0.0, y, engaged: false }, 1.0 / 60.0);
-                assert_eq!(e.committed_syms(), [0], "release must land the dominant letter");
+                e.step(
+                    PointerInput {
+                        dx: 0.0,
+                        y,
+                        engaged: false,
+                    },
+                    1.0 / 60.0,
+                );
+                assert_eq!(
+                    e.committed_syms(),
+                    [0],
+                    "release must land the dominant letter"
+                );
                 let evs = e.drain_text_events();
                 assert!(
-                    evs.iter().any(|ev| matches!(ev, TextEvent::Commit(s) if s == "a")),
+                    evs.iter()
+                        .any(|ev| matches!(ev, TextEvent::Commit(s) if s == "a")),
                     "release commit must emit an event: {evs:?}"
                 );
                 released = true;
                 break;
             }
-            e.step(PointerInput { dx: 1.0, y, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: 1.0,
+                    y,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
         }
-        assert!(released, "'a' should have become dominant under the crosshair");
+        assert!(
+            released,
+            "'a' should have become dominant under the crosshair"
+        );
     }
 
     #[test]
@@ -1490,9 +1654,26 @@ mod tests {
         let mut e = engine();
         e.set_viewport_px(1000.0);
         // Expand the root but never zoom: no box dominates the full-width view.
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: true }, 1.0 / 60.0);
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
-        assert!(e.committed_syms().is_empty(), "a plain pause must not commit");
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: true,
+            },
+            1.0 / 60.0,
+        );
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
+        assert!(
+            e.committed_syms().is_empty(),
+            "a plain pause must not commit"
+        );
     }
 
     #[test]
@@ -1506,7 +1687,14 @@ mod tests {
         for _ in 0..600 {
             let (v_lo, v_hi) = e.view();
             let y = (target - v_lo) / (v_hi - v_lo);
-            e.step(PointerInput { dx: 1.0, y, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: 1.0,
+                    y,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
             if e.committed_syms().is_empty() && e.pending_syms().first() == Some(&0) {
                 saw_preview = true;
             }
@@ -1530,10 +1718,20 @@ mod tests {
             vec![1.0 / self.n as f64; self.n]
         }
         fn learn(&mut self, context: &[u8], sym: u8) {
-            *self.counts.lock().unwrap().entry((context.to_vec(), sym)).or_default() += 1;
+            *self
+                .counts
+                .lock()
+                .unwrap()
+                .entry((context.to_vec(), sym))
+                .or_default() += 1;
         }
         fn unlearn(&mut self, context: &[u8], sym: u8) {
-            *self.counts.lock().unwrap().entry((context.to_vec(), sym)).or_default() -= 1;
+            *self
+                .counts
+                .lock()
+                .unwrap()
+                .entry((context.to_vec(), sym))
+                .or_default() -= 1;
         }
         fn alphabet_len(&self) -> usize {
             self.n
@@ -1545,7 +1743,10 @@ mod tests {
         let a = Alphabet::english_v1();
         let n = a.len();
         let counts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let lm = CountingModel { n, counts: counts.clone() };
+        let lm = CountingModel {
+            n,
+            counts: counts.clone(),
+        };
         let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
         e.set_viewport_px(1000.0);
         e.speed_bits = 8.0;
@@ -1568,7 +1769,10 @@ mod tests {
         assert_eq!(e.view(), (0.0, 1.0), "view back at the root frame");
         assert_eq!(e.nodes.len(), 1, "tree back to a single root");
         assert_eq!(e.speed_bits, e.params.max_bits_per_sec, "speed restored");
-        assert!(e.drain_text_events().is_empty(), "reset emits no text events");
+        assert!(
+            e.drain_text_events().is_empty(),
+            "reset emits no text events"
+        );
         assert!(
             counts.lock().unwrap().values().all(|&c| c == 0),
             "reset must unlearn every commit, leaving the LM at baseline"
@@ -1634,9 +1838,22 @@ mod tests {
             let (lo, hi) = e.path_interval(&[arg]);
             let (v_lo, v_hi) = e.view();
             let y = ((lo + hi) / 2.0 - v_lo) / (v_hi - v_lo);
-            e.step(PointerInput { dx: 1.0, y: y.clamp(0.0, 1.0), engaged: true }, 1.0 / 60.0);
-            max_depth =
-                max_depth.max(e.nodes.iter().filter(|x| x.alive).map(|x| x.depth).max().unwrap_or(0));
+            e.step(
+                PointerInput {
+                    dx: 1.0,
+                    y: y.clamp(0.0, 1.0),
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
+            max_depth = max_depth.max(
+                e.nodes
+                    .iter()
+                    .filter(|x| x.alive)
+                    .map(|x| x.depth)
+                    .max()
+                    .unwrap_or(0),
+            );
             max_nodes = max_nodes.max(e.nodes.len());
             // The deepest box that fully contains the view is the one the user
             // is inside. Once it dominates the view it must be expanded with
@@ -1685,8 +1902,16 @@ mod tests {
         e.speed_bits = 8.0;
         let target = e.alphabet.encode("The man");
         let ok = steer_to(&mut e, &target, 40000);
-        eprintln!("committed = {:?} ledger={}", e.committed_text(), e.ledger.len());
-        assert!(ok, "should type 'The man' under forced rebase, got {:?}", e.committed_text());
+        eprintln!(
+            "committed = {:?} ledger={}",
+            e.committed_text(),
+            e.ledger.len()
+        );
+        assert!(
+            ok,
+            "should type 'The man' under forced rebase, got {:?}",
+            e.committed_text()
+        );
     }
 
     /// A grouped character ('A', inside the capitals group) is reachable and
@@ -1714,7 +1939,14 @@ mod tests {
         assert!(steer_to(&mut e, &target, 5000), "should write 'cab'");
         assert!(!e.ledger.is_empty(), "frame should have advanced");
         for _ in 0..5000 {
-            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
             if e.committed_syms().is_empty() && e.ledger.is_empty() {
                 break;
             }
@@ -1740,7 +1972,14 @@ mod tests {
         assert!(steer_to(&mut e, &target, 40000), "should write 'I have'");
         assert!(!e.ledger.is_empty(), "frame should have advanced");
         for _ in 0..40000 {
-            e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
             if e.committed_syms().is_empty() && e.ledger.is_empty() {
                 break;
             }
@@ -1787,7 +2026,14 @@ mod tests {
     fn visible_marks_group_boxes() {
         let mut e = full_engine();
         e.set_viewport_px(1000.0);
-        e.step(PointerInput { dx: 0.0, y: 0.5, engaged: false }, 1.0 / 60.0);
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
         let boxes = e.visible();
         assert!(
             boxes.iter().any(|b| b.group == Some(GroupColor::Capitals)),
@@ -1805,22 +2051,52 @@ mod tests {
     fn adaptive_speed_rises_and_drops() {
         let a = Alphabet::english_v1();
         let n = a.len();
-        let mut p = EngineParams { adaptive_speed: true, ..EngineParams::default() };
+        let mut p = EngineParams {
+            adaptive_speed: true,
+            ..EngineParams::default()
+        };
         p.min_bits_per_sec = 1.5;
         p.max_bits_per_sec = 8.0;
         let mut e = Engine::new(a, Box::new(UniformModel(n)), p);
         e.set_viewport_px(1000.0);
         let start = e.speed_bits;
         for _ in 0..300 {
-            e.step(PointerInput { dx: 1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
+            e.step(
+                PointerInput {
+                    dx: 1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
         }
         let risen = e.speed_bits;
-        assert!(risen > start + 0.5, "smooth steering must raise the cap: {start} -> {risen}");
+        assert!(
+            risen > start + 0.5,
+            "smooth steering must raise the cap: {start} -> {risen}"
+        );
         // A hard reversal cuts it immediately.
-        e.step(PointerInput { dx: 1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
-        e.step(PointerInput { dx: -1.0, y: 0.5, engaged: true }, 1.0 / 60.0);
-        assert!(e.speed_bits < risen, "a reversal must cut the cap: {risen} -> {}", e.speed_bits);
+        e.step(
+            PointerInput {
+                dx: 1.0,
+                y: 0.5,
+                engaged: true,
+            },
+            1.0 / 60.0,
+        );
+        e.step(
+            PointerInput {
+                dx: -1.0,
+                y: 0.5,
+                engaged: true,
+            },
+            1.0 / 60.0,
+        );
+        assert!(
+            e.speed_bits < risen,
+            "a reversal must cut the cap: {risen} -> {}",
+            e.speed_bits
+        );
         assert!(e.speed_bits >= e.params.min_bits_per_sec);
     }
 }
-

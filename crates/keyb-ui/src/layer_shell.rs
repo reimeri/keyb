@@ -62,7 +62,9 @@ impl raw_window_handle::HasDisplayHandle for WaylandHandles {
             .ok_or(raw_window_handle::HandleError::Unavailable)?;
         let raw = raw_window_handle::WaylandDisplayHandle::new(ptr);
         Ok(unsafe {
-            raw_window_handle::DisplayHandle::borrow_raw(raw_window_handle::RawDisplayHandle::Wayland(raw))
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::Wayland(raw),
+            )
         })
     }
 }
@@ -75,7 +77,9 @@ impl raw_window_handle::HasWindowHandle for WaylandHandles {
             .ok_or(raw_window_handle::HandleError::Unavailable)?;
         let raw = raw_window_handle::WaylandWindowHandle::new(ptr);
         Ok(unsafe {
-            raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Wayland(raw))
+            raw_window_handle::WindowHandle::borrow_raw(
+                raw_window_handle::RawWindowHandle::Wayland(raw),
+            )
         })
     }
 }
@@ -132,7 +136,12 @@ impl AppState {
         let ow = info
             .logical_size
             .map(|(w, _)| w)
-            .or_else(|| info.modes.iter().find(|m| m.current).map(|m| m.dimensions.0))
+            .or_else(|| {
+                info.modes
+                    .iter()
+                    .find(|m| m.current)
+                    .map(|m| m.dimensions.0)
+            })
             .filter(|w| *w > 0);
         let Some(ow) = ow else {
             return;
@@ -157,7 +166,8 @@ impl AppState {
         self.core.visible = vis;
         self.core.engaged = false;
         if vis {
-            self.layer.set_anchor(Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
+            self.layer
+                .set_anchor(Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
             self.layer.set_size(self.full_width, 0);
         } else {
             self.layer.set_anchor(Anchor::RIGHT);
@@ -237,7 +247,12 @@ impl OutputHandler for AppState {
         self.apply_output_width(&output);
     }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
         self.apply_output_width(&output);
     }
 
@@ -406,7 +421,10 @@ pub fn run(core: Core) -> Result<(), LayerError> {
     match setup(core) {
         Ok((mut state, mut queue)) => loop {
             if let Err(e) = queue.blocking_dispatch(&mut state) {
-                return Err(Box::new((state.core, anyhow!(e).context("wayland dispatch"))));
+                return Err(Box::new((
+                    state.core,
+                    anyhow!(e).context("wayland dispatch"),
+                )));
             }
             if state.exit {
                 return Ok(());
@@ -435,12 +453,12 @@ fn wayland_parts() -> Result<Parts> {
     let (globals, queue) = registry_queue_init::<AppState>(&conn)?;
     let qh = queue.handle();
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor")?;
-    let layer_shell = LayerShell::bind(&globals, &qh).context("compositor lacks wlr-layer-shell")?;
+    let layer_shell =
+        LayerShell::bind(&globals, &qh).context("compositor lacks wlr-layer-shell")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm")?;
 
     let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("keyb"), None);
+    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("keyb"), None);
     let w = osk_width(None);
     // Full-height column on the right edge. Width fixed; height 0 = let the
     // compositor fill top-to-bottom.

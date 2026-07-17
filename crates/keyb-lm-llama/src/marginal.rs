@@ -46,7 +46,12 @@ impl VocabIndex {
             .filter(|&t| !tok_syms[t as usize].is_empty())
             .collect();
         sorted.sort_by(|&a, &b| tok_syms[a as usize].cmp(&tok_syms[b as usize]));
-        VocabIndex { tok_syms, tok_full, sorted, n_sym: alphabet.len() }
+        VocabIndex {
+            tok_syms,
+            tok_full,
+            sorted,
+            n_sym: alphabet.len(),
+        }
     }
 
     /// Symbols of token `t` (truncated at the first out-of-alphabet byte).
@@ -105,7 +110,14 @@ mod tests {
     fn masses_split_between_continuations_and_exact() {
         // Vocab: "str", "straw", "strawberry", "street", "Straw" (case-invalid),
         // "str\xff" (invalid tail).
-        let (v, a) = vocab(&["str", "straw", "strawberry", "street", "Straw", "str\u{00ff}"]);
+        let (v, a) = vocab(&[
+            "str",
+            "straw",
+            "strawberry",
+            "street",
+            "Straw",
+            "str\u{00ff}",
+        ]);
         let probs = [0.1f32, 0.2, 0.3, 0.25, 0.1, 0.05];
         let s = a.encode("str");
         let (cont, exact) = v.char_masses(&probs, &s);
@@ -114,7 +126,10 @@ mod tests {
         // syms exactly "str" but is not fully valid → contributes nowhere.
         assert!((cont[a.index_of('a').unwrap() as usize] - 0.5).abs() < 1e-6);
         assert!((cont[a.index_of('e').unwrap() as usize] - 0.25).abs() < 1e-6);
-        assert!((exact - 0.1).abs() < 1e-6, "only exact 'str' ends here: {exact}");
+        assert!(
+            (exact - 0.1).abs() < 1e-6,
+            "only exact 'str' ends here: {exact}"
+        );
         let total: f64 = cont.iter().sum::<f64>() + exact;
         assert!((total - 0.85).abs() < 1e-6, "invalid-mass dropped: {total}");
     }
@@ -138,8 +153,23 @@ mod tests {
     #[test]
     fn char_masses_equal_bruteforce_sums() {
         let pieces = [
-            "a", "ab", "abc", "b", "ba", " ", " a", "a b", "'", "a'", "ab'",
-            "A", "aB", "ab\u{00e9}", "", "abcd", "abcde",
+            "a",
+            "ab",
+            "abc",
+            "b",
+            "ba",
+            " ",
+            " a",
+            "a b",
+            "'",
+            "a'",
+            "ab'",
+            "A",
+            "aB",
+            "ab\u{00e9}",
+            "",
+            "abcd",
+            "abcde",
         ];
         let (v, a) = vocab(&pieces);
         let mut probs = vec![0.0f32; pieces.len()];
@@ -157,7 +187,9 @@ mod tests {
                     .chars()
                     .map_while(|c| if c.is_ascii() { a.index_of(c) } else { None })
                     .collect();
-                let valid = piece.chars().all(|c| c.is_ascii() && a.index_of(c).is_some())
+                let valid = piece
+                    .chars()
+                    .all(|c| c.is_ascii() && a.index_of(c).is_some())
                     && !piece.is_empty();
                 if syms.len() > s.len() && syms.starts_with(&s) {
                     b_cont[syms[s.len()] as usize] += probs[t] as f64;

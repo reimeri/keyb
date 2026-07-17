@@ -38,9 +38,19 @@ fn grouped_alphabet_keeps_wpm_on_lowercase() {
     e.speed_bits = 6.0;
     let target = "the weather today is quite nice and i would like to go for a walk in the park";
     let r = run_oracle(&mut e, target, &OracleParams::default(), 42);
-    eprintln!("grouped oracle: wpm={:.1} chars={} secs={:.1}", r.wpm, r.chars, r.secs);
-    assert!(r.completed, "oracle did not finish on grouped alphabet: {r:?}");
-    assert!(r.wpm >= 15.0, "grouped alphabet must hold ≥ 15 WPM, got {:.1}", r.wpm);
+    eprintln!(
+        "grouped oracle: wpm={:.1} chars={} secs={:.1}",
+        r.wpm, r.chars, r.secs
+    );
+    assert!(
+        r.completed,
+        "oracle did not finish on grouped alphabet: {r:?}"
+    );
+    assert!(
+        r.wpm >= 15.0,
+        "grouped alphabet must hold ≥ 15 WPM, got {:.1}",
+        r.wpm
+    );
 }
 
 #[test]
@@ -52,7 +62,10 @@ fn oracle_handles_unseeded_text() {
     let r = run_oracle(
         &mut e,
         "quartz jukebox vex",
-        &OracleParams { max_secs: 300.0, ..Default::default() },
+        &OracleParams {
+            max_secs: 300.0,
+            ..Default::default()
+        },
         7,
     );
     eprintln!("rare-letter oracle: {r:?}");

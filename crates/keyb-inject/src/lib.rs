@@ -52,7 +52,10 @@ impl Default for RetractionLedger {
 
 impl RetractionLedger {
     pub fn new(cap: usize) -> Self {
-        RetractionLedger { chunks: VecDeque::new(), cap }
+        RetractionLedger {
+            chunks: VecDeque::new(),
+            cap,
+        }
     }
 
     pub fn push(&mut self, text: &str) {
@@ -122,7 +125,10 @@ pub struct BufferInjector {
 
 impl BufferInjector {
     pub fn quiet() -> Self {
-        BufferInjector { text: String::new(), quiet: true }
+        BufferInjector {
+            text: String::new(),
+            quiet: true,
+        }
     }
 }
 
@@ -146,7 +152,10 @@ impl Injector for BufferInjector {
     }
 
     fn capabilities(&self) -> Caps {
-        Caps { name: "buffer", true_retraction: true }
+        Caps {
+            name: "buffer",
+            true_retraction: true,
+        }
     }
 }
 

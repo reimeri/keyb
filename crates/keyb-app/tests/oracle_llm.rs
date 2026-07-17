@@ -20,12 +20,19 @@ fn oracle_reaches_m2_wpm_target_on_held_out_text() {
     e.speed_bits = 6.0;
     // Held out: not in the PPM seed corpus, not an M1 test sentence.
     let target = "the council will meet on thursday to discuss the new housing proposal";
-    let params = OracleParams { realtime: true, ..Default::default() };
+    let params = OracleParams {
+        realtime: true,
+        ..Default::default()
+    };
     let r = run_oracle(&mut e, target, &params, 43);
     eprintln!(
         "llm oracle: completed={} chars={} secs={:.1} wpm={:.1}",
         r.completed, r.chars, r.secs, r.wpm
     );
     assert!(r.completed, "oracle did not finish: {r:?}");
-    assert!(r.wpm >= 25.0, "M2 target is 25 WPM held-out, got {:.1}", r.wpm);
+    assert!(
+        r.wpm >= 25.0,
+        "M2 target is 25 WPM held-out, got {:.1}",
+        r.wpm
+    );
 }

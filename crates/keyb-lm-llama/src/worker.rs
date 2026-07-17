@@ -111,7 +111,12 @@ impl<'m> Worker<'m> {
             .clear_kv_cache_seq(Some(seq as u32), None, None)
             .map_err(|e| format!("kv clear: {e}"))?;
         self.ctx
-            .copy_kv_cache_seq(src_seq, seq, Some(0), Some((self.n_preamble + k as i32) as u32))
+            .copy_kv_cache_seq(
+                src_seq,
+                seq,
+                Some(0),
+                Some((self.n_preamble + k as i32) as u32),
+            )
             .map_err(|e| format!("kv copy: {e}"))?;
         let tail = &tokens[k..];
         let mut batch = LlamaBatch::new(tail.len(), 1);
@@ -121,12 +126,18 @@ impl<'m> Worker<'m> {
                 .add(t, pos, &[seq], i + 1 == tail.len())
                 .map_err(|e| format!("batch add: {e}"))?;
         }
-        self.ctx.decode(&mut batch).map_err(|e| format!("decode: {e}"))?;
+        self.ctx
+            .decode(&mut batch)
+            .map_err(|e| format!("decode: {e}"))?;
         let probs: Arc<[f32]> = softmax(self.ctx.get_logits_ith(batch.n_tokens() - 1)).into();
         self.tick += 1;
         self.branches.insert(
             tokens.into(),
-            Branch { seq, probs: probs.clone(), last_used: self.tick },
+            Branch {
+                seq,
+                probs: probs.clone(),
+                last_used: self.tick,
+            },
         );
         Ok(probs)
     }
@@ -234,8 +245,7 @@ pub fn run(
 ) {
     // llama.cpp's backend is process-global and may only be initialized once
     // (several workers exist under `cargo test`).
-    static BACKEND: std::sync::OnceLock<Result<LlamaBackend, String>> =
-        std::sync::OnceLock::new();
+    static BACKEND: std::sync::OnceLock<Result<LlamaBackend, String>> = std::sync::OnceLock::new();
     let setup = || -> Result<(&'static LlamaBackend, LlamaModel), String> {
         let backend = BACKEND
             .get_or_init(|| {
@@ -315,7 +325,10 @@ pub fn run(
     };
     let mut batch = LlamaBatch::new(preamble_toks.len(), 1);
     for (i, &t) in preamble_toks.iter().enumerate() {
-        if batch.add(t, i as i32, &[0], i + 1 == preamble_toks.len()).is_err() {
+        if batch
+            .add(t, i as i32, &[0], i + 1 == preamble_toks.len())
+            .is_err()
+        {
             let _ = ready.send(Err("preamble batch".into()));
             return;
         }
@@ -326,8 +339,14 @@ pub fn run(
     }
     w.n_preamble = preamble_toks.len() as i32;
     let probs: Arc<[f32]> = softmax(w.ctx.get_logits_ith(batch.n_tokens() - 1)).into();
-    w.branches
-        .insert(Vec::new().into_boxed_slice(), Branch { seq: 0, probs, last_used: 0 });
+    w.branches.insert(
+        Vec::new().into_boxed_slice(),
+        Branch {
+            seq: 0,
+            probs,
+            last_used: 0,
+        },
+    );
     let _ = ready.send(Ok(()));
 
     // Request state: newest-first, hint-adjacent boosted, cancellable.
@@ -370,7 +389,11 @@ pub fn run(
         let pick = pending
             .iter()
             .rposition(|c| c.starts_with(&hint) || hint.starts_with(c))
-            .or(if pending.is_empty() { None } else { Some(pending.len() - 1) });
+            .or(if pending.is_empty() {
+                None
+            } else {
+                Some(pending.len() - 1)
+            });
         if let Some(i) = pick {
             let ctx = pending.remove(i);
             if cancelled.remove(&ctx) {
@@ -392,7 +415,9 @@ pub fn run(
         // chain — one forward pass per loop so real requests preempt.
         let mut cur = hint.clone();
         'speculate: for _ in 0..SPECULATE_DEPTH {
-            let Some(dist) = w.computed.get(&cur).cloned() else { break };
+            let Some(dist) = w.computed.get(&cur).cloned() else {
+                break;
+            };
             let mut order: Vec<usize> = (0..dist.len()).collect();
             order.sort_by(|&a, &b| dist[b].total_cmp(&dist[a]));
             for &sym in order.iter().take(SPECULATE_K) {
@@ -403,7 +428,13 @@ pub fn run(
                 }
                 match w.compute(&child) {
                     Ok(d) => {
-                        if tx.send(FromWorker { ctx: child, dist: d }).is_err() {
+                        if tx
+                            .send(FromWorker {
+                                ctx: child,
+                                dist: d,
+                            })
+                            .is_err()
+                        {
                             break 'main;
                         }
                     }

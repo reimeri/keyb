@@ -57,14 +57,10 @@ impl App {
         let (cx, cy) = self.core.cursor;
         if !self.core.visible {
             self.core.visible = true;
-        } else if crate::scene::hide_button_rect(lw)
-            .contains(vello::kurbo::Point::new(cx, cy))
-        {
+        } else if crate::scene::hide_button_rect(lw).contains(vello::kurbo::Point::new(cx, cy)) {
             self.core.visible = false;
             self.core.engaged = false;
-        } else if crate::scene::reset_button_rect(lw)
-            .contains(vello::kurbo::Point::new(cx, cy))
-        {
+        } else if crate::scene::reset_button_rect(lw).contains(vello::kurbo::Point::new(cx, cy)) {
             self.core.reset();
         } else {
             self.core.engaged = true;
@@ -82,7 +78,11 @@ impl App {
             .or_else(|| event_loop.available_monitors().next());
         let (msize, mpos, mscale) = monitor
             .map(|m| (m.size(), m.position(), m.scale_factor()))
-            .unwrap_or((PhysicalSize::new(1920, 1080), PhysicalPosition::new(0, 0), 1.0));
+            .unwrap_or((
+                PhysicalSize::new(1920, 1080),
+                PhysicalPosition::new(0, 0),
+                1.0,
+            ));
         // KEYB_WIDTH is logical px; otherwise 1/3 of the monitor. Widths here
         // are physical, so scale the env override and pass the physical monitor
         // width to `osk_width` for the 1/3 default.
@@ -220,7 +220,12 @@ pub fn run(core: Core, osk: bool) -> Result<()> {
         EventLoop::new()?
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { core, gpu: Gpu::new(), state: None, osk };
+    let mut app = App {
+        core,
+        gpu: Gpu::new(),
+        state: None,
+        osk,
+    };
     event_loop.run_app(&mut app)?;
     Ok(())
 }

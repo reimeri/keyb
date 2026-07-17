@@ -3,14 +3,34 @@ use keyb_core::{Alphabet, Engine, EngineParams, LanguageModel, TextEvent};
 use keyb_inject::{Injector, RetractionLedger};
 use keyb_lm_llama::{LlamaConfig, LlamaLm};
 use keyb_lm_ppm::PpmModel;
+use std::ffi::OsString;
 
-/// LLM if the model file is present (`KEYB_MODEL` overrides the default
-/// path), PPM alone otherwise — the interface works either way, the boxes
-/// are just less prescient.
-fn language_model(alphabet: &Alphabet) -> Box<dyn LanguageModel> {
+mod model_download;
+
+fn configured_model(model_override: Option<OsString>) -> (LlamaConfig, bool) {
     let mut cfg = LlamaConfig::default();
-    if let Some(p) = std::env::var_os("KEYB_MODEL") {
-        cfg.model_path = p.into();
+    let managed_default = model_override.is_none();
+    if let Some(path) = model_override {
+        cfg.model_path = path.into();
+    }
+    (cfg, managed_default)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Provision and load the default LLM (`KEYB_MODEL` selects a user-managed
+/// file), falling back to PPM so download and load failures never prevent use.
+fn language_model(alphabet: &Alphabet) -> Box<dyn LanguageModel> {
+    let (cfg, managed_default) = configured_model(std::env::var_os("KEYB_MODEL"));
+    if managed_default && !env_flag("KEYB_NO_MODEL_DOWNLOAD") {
+        if let Err(error) = model_download::ensure_default_model(&cfg.model_path) {
+            eprintln!("keyb: model download failed: {error:#} — running on PPM only");
+            return Box::new(PpmModel::seeded(alphabet));
+        }
     }
     if !cfg.model_path.exists() {
         eprintln!(
@@ -72,12 +92,18 @@ fn main() -> Result<()> {
     let alphabet = Alphabet::english_full();
     let lm = language_model(&alphabet);
 
-    let chars: Vec<char> = (0..alphabet.len() as u8).map(|s| alphabet.char_of(s)).collect();
+    let chars: Vec<char> = (0..alphabet.len() as u8)
+        .map(|s| alphabet.char_of(s))
+        .collect();
     let (tx, caps) = injection_worker(keyb_inject::detect(&chars));
     eprintln!(
         "keyb: injecting via {} ({} retraction)",
         caps.name,
-        if caps.true_retraction { "true" } else { "backspace" }
+        if caps.true_retraction {
+            "true"
+        } else {
+            "backspace"
+        }
     );
 
     let mut params = EngineParams::default();
@@ -88,7 +114,29 @@ fn main() -> Result<()> {
     }
 
     let engine = Engine::new(alphabet, lm, params);
-    keyb_ui::run(engine, Box::new(move |ev| {
-        let _ = tx.send(ev);
-    }))
+    keyb_ui::run(
+        engine,
+        Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_model_paths_are_not_managed() {
+        let (cfg, managed) = configured_model(Some(OsString::from("/tmp/custom.gguf")));
+        assert_eq!(cfg.model_path, std::path::Path::new("/tmp/custom.gguf"));
+        assert!(!managed);
+    }
+
+    #[test]
+    fn default_model_path_is_managed() {
+        let (cfg, managed) = configured_model(None);
+        assert_eq!(cfg.model_path, keyb_lm_llama::default_model_path());
+        assert!(managed);
+    }
 }

@@ -83,9 +83,15 @@ fn run(name: &str, mk: impl Fn(&Alphabet) -> Box<dyn LanguageModel>, realtime: b
         let mut e = Engine::new(alphabet, lm, EngineParams::default());
         e.set_viewport_px(800.0);
         e.speed_bits = 6.0;
-        let params = OracleParams { realtime, ..Default::default() };
+        let params = OracleParams {
+            realtime,
+            ..Default::default()
+        };
         let r = run_oracle(&mut e, target, &params, 42 + i as u64);
-        let (req, upg) = (requests.load(Ordering::Relaxed), upgrades.load(Ordering::Relaxed));
+        let (req, upg) = (
+            requests.load(Ordering::Relaxed),
+            upgrades.load(Ordering::Relaxed),
+        );
         println!(
             "[{}] completed={} chars={:3} secs={:6.1} wpm={:5.1} fallback={:4.1}%  \"{}...\"",
             i,

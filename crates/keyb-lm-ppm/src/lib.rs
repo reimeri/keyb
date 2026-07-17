@@ -56,14 +56,11 @@ impl PpmModel {
     fn learn_at(&mut self, context: &[u8], sym: u8) {
         for k in 0..=self.order.min(context.len()) {
             let key = &context[context.len() - k..];
-            let entry = self
-                .contexts
-                .entry(key.into())
-                .or_insert_with(|| Counts {
-                    counts: vec![0; self.n_sym],
-                    total: 0,
-                    distinct: 0,
-                });
+            let entry = self.contexts.entry(key.into()).or_insert_with(|| Counts {
+                counts: vec![0; self.n_sym],
+                total: 0,
+                distinct: 0,
+            });
             if entry.counts[sym as usize] == 0 {
                 entry.distinct += 1;
             }
@@ -81,7 +78,9 @@ impl LanguageModel for PpmModel {
         // Ascend through orders; each seen context re-blends over the shorter one.
         for k in 0..=self.order.min(context.len()) {
             let key = &context[context.len() - k..];
-            let Some(c) = self.contexts.get(key) else { continue };
+            let Some(c) = self.contexts.get(key) else {
+                continue;
+            };
             if c.total == 0 {
                 continue;
             }
@@ -89,7 +88,11 @@ impl LanguageModel for PpmModel {
             let escape = ((self.alpha + self.beta * c.distinct as f64) / denom).clamp(0.0, 1.0);
             for s in 0..n {
                 let cnt = c.counts[s] as f64;
-                let direct = if cnt > 0.0 { (cnt - self.beta).max(0.0) / denom } else { 0.0 };
+                let direct = if cnt > 0.0 {
+                    (cnt - self.beta).max(0.0) / denom
+                } else {
+                    0.0
+                };
                 p[s] = direct + escape * p[s];
             }
         }

@@ -36,7 +36,9 @@ fn upgraded(lm: &mut LlamaLm, ctx: &[u8], deadline: Duration) -> Vec<f64> {
 
 #[test]
 fn upgrades_arrive_and_are_valid_distributions() {
-    let Some((mut lm, alphabet)) = lm_or_skip() else { return };
+    let Some((mut lm, alphabet)) = lm_or_skip() else {
+        return;
+    };
     for text in ["", "the weather is ", "hello wor"] {
         let ctx = alphabet.encode(text);
         let dist = upgraded(&mut lm, &ctx, Duration::from_secs(10));
@@ -52,7 +54,9 @@ fn upgrades_arrive_and_are_valid_distributions() {
 
 #[test]
 fn llm_beats_uniform_on_obvious_continuations() {
-    let Some((mut lm, alphabet)) = lm_or_skip() else { return };
+    let Some((mut lm, alphabet)) = lm_or_skip() else {
+        return;
+    };
     // Mid-token healing: "nic" inside "...is nice" should strongly favor 'e'.
     let ctx = alphabet.encode("the weather today is really nic");
     let dist = upgraded(&mut lm, &ctx, Duration::from_secs(10));
@@ -68,9 +72,15 @@ fn llm_beats_uniform_on_obvious_continuations() {
 
 #[test]
 fn request_to_upgrade_latency_within_budget() {
-    let Some((mut lm, alphabet)) = lm_or_skip() else { return };
+    let Some((mut lm, alphabet)) = lm_or_skip() else {
+        return;
+    };
     // Warm up (first request pays branch construction for the whole prefix).
-    let _ = upgraded(&mut lm, &alphabet.encode("we went to"), Duration::from_secs(10));
+    let _ = upgraded(
+        &mut lm,
+        &alphabet.encode("we went to"),
+        Duration::from_secs(10),
+    );
     // Steady state: extend one symbol at a time, like steering does.
     let mut lats = Vec::new();
     let base = alphabet.encode("we went to the market and bought some");

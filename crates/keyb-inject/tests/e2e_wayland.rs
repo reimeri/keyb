@@ -53,7 +53,11 @@ fn start_sway() -> Sway {
     // source is sway itself: exec a child that dumps $WAYLAND_DISPLAY.
     let probe = PathBuf::from(&runtime).join(format!("keyb-e2e-display-{}", child.id()));
     let _ = std::fs::remove_file(&probe);
-    let mut sway = Sway { child, display: String::new(), ipc };
+    let mut sway = Sway {
+        child,
+        display: String::new(),
+        ipc,
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !sway.ipc.exists() {
         assert!(Instant::now() < deadline, "sway IPC socket never appeared");
@@ -61,7 +65,10 @@ fn start_sway() -> Sway {
     }
     swaymsg(
         &sway,
-        &["exec", &format!("sh -c 'echo $WAYLAND_DISPLAY > {}'", probe.display())],
+        &[
+            "exec",
+            &format!("sh -c 'echo $WAYLAND_DISPLAY > {}'", probe.display()),
+        ],
     );
     sway.display = loop {
         let s = std::fs::read_to_string(&probe).unwrap_or_default();
@@ -111,14 +118,18 @@ fn read_out(path: &std::path::Path) -> String {
         if !s.is_empty() {
             return s;
         }
-        assert!(Instant::now() < deadline, "no text arrived in {}", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "no text arrived in {}",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 const CHARS: &[char] = &[
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-    's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '.', ',', '\'', '\n',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '.', ',', '\'', '\n',
 ];
 
 fn run_case(name: &str, make: impl Fn() -> WaylandInjector) -> String {
@@ -145,7 +156,9 @@ fn commit_and_retract_reach_a_real_terminal() {
         return;
     }
     // Virtual-keyboard path (key synthesis + BackSpace retraction).
-    let vk = run_case("vk", || WaylandInjector::vk_only(CHARS).expect("vk injector"));
+    let vk = run_case("vk", || {
+        WaylandInjector::vk_only(CHARS).expect("vk injector")
+    });
     assert_eq!(vk, "the quick cat\n", "virtual-keyboard path");
     // Hybrid path: commits ride input-method-v2 (foot speaks text-input-v3);
     // retraction must detect that a terminal has no surrounding text and

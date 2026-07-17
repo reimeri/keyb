@@ -70,7 +70,15 @@ fn try_phrase(text: &str, rebase: f64) -> (bool, String) {
     let mut e = Engine::new(alphabet, Box::new(lm), params);
     e.set_viewport_px(900.0);
     e.speed_bits = 6.0;
-    let r = run_oracle(&mut e, text, &OracleParams { max_secs: 400.0, ..Default::default() }, 5);
+    let r = run_oracle(
+        &mut e,
+        text,
+        &OracleParams {
+            max_secs: 400.0,
+            ..Default::default()
+        },
+        5,
+    );
     (r.completed, e.committed_text())
 }
 
@@ -85,5 +93,8 @@ fn guided_the_man_completes() {
 fn guided_the_man_completes_forced_rebase() {
     let (ok, got) = try_phrase("The man", 0.5);
     eprintln!("The man (forced rebase) -> {got:?} ok={ok}");
-    assert!(ok, "stuck typing 'The man' under forced rebase: got {got:?}");
+    assert!(
+        ok,
+        "stuck typing 'The man' under forced rebase: got {got:?}"
+    );
 }

@@ -215,7 +215,10 @@ fn build_keymap(chars: &[char], codes: &[u32]) -> String {
     for (i, (&c, &code)) in chars.iter().zip(codes).enumerate() {
         let xkb = code + 8;
         keycodes.push_str(&format!("        <K{i}> = {xkb};\n"));
-        syms.push_str(&format!("        key <K{i}> {{ [ {} ] }};\n", keysym_name(c)));
+        syms.push_str(&format!(
+            "        key <K{i}> {{ [ {} ] }};\n",
+            keysym_name(c)
+        ));
     }
     format!(
         "xkb_keymap {{\n\
@@ -235,9 +238,7 @@ fn build_keymap(chars: &[char], codes: &[u32]) -> String {
 }
 
 fn memfd_with(content: &str) -> Result<OwnedFd> {
-    let fd = unsafe {
-        libc::memfd_create(c"keyb-keymap".as_ptr(), libc::MFD_CLOEXEC)
-    };
+    let fd = unsafe { libc::memfd_create(c"keyb-keymap".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         bail!("memfd_create failed: {}", std::io::Error::last_os_error());
     }
@@ -285,7 +286,9 @@ impl WaylandInjector {
         }
 
         let codes = assign_keycodes(&chars);
-        let im = im_manager.as_ref().map(|m| m.get_input_method(&seat, &qh, ()));
+        let im = im_manager
+            .as_ref()
+            .map(|m| m.get_input_method(&seat, &qh, ()));
         let mut keymap_fd = None;
         let vk = match vk_manager.as_ref() {
             Some(m) => {
@@ -326,7 +329,9 @@ impl WaylandInjector {
     }
 
     fn pump(&mut self) -> Result<()> {
-        self.queue.roundtrip(&mut self.state).context("wayland roundtrip")?;
+        self.queue
+            .roundtrip(&mut self.state)
+            .context("wayland roundtrip")?;
         Ok(())
     }
 
@@ -411,9 +416,7 @@ impl Injector for WaylandInjector {
             // Truthful only on the no-vk fallback where retraction actually
             // goes through delete_surrounding_text; with a virtual keyboard
             // present, every retraction is backspace synthesis.
-            true_retraction: self.vk.is_none()
-                && self.im_usable()
-                && self.state.im_surrounding,
+            true_retraction: self.vk.is_none() && self.im_usable() && self.state.im_surrounding,
         }
     }
 }
@@ -430,7 +433,10 @@ mod tests {
         assert!(km.contains("[ U0061 ]"));
         assert!(km.contains("[ U0020 ]"));
         assert!(km.contains("[ BackSpace ]"));
-        assert!(km.contains("maximum = 66;"), "headroom above xkb 65 (space)");
+        assert!(
+            km.contains("maximum = 66;"),
+            "headroom above xkb 65 (space)"
+        );
     }
 
     #[test]

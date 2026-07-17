@@ -33,8 +33,8 @@ impl FontAssets {
                     .find(|p| p.exists())
             })
             .context("no usable sans font found (tried fc-match and known paths)")?;
-        let data = std::fs::read(&path)
-            .with_context(|| format!("reading font {}", path.display()))?;
+        let data =
+            std::fs::read(&path).with_context(|| format!("reading font {}", path.display()))?;
         let font = Font::new(Blob::new(std::sync::Arc::new(data.clone())), 0);
         Ok(FontAssets { font, data })
     }
