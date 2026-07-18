@@ -7,7 +7,7 @@
 //! branch stores its full next-token distribution so every intra-token
 //! request against it is answered without another forward pass.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,8 +43,12 @@ pub struct FromWorker {
     pub ctx: Vec<u8>,
     /// Raw LLM char distribution over the alphabet (pre-smoothing). Sums to 1
     /// unless everything was out-of-alphabet (then it is all zeros and the
-    /// adapter keeps its fallback).
-    pub dist: Vec<f64>,
+    /// adapter keeps its fallback). `None` means the request was not serviced
+    /// (compute failed, or the queue shed it): the adapter clears its
+    /// in-flight marker so a later `predict` may re-request. Every `Predict`
+    /// gets exactly one reply — a silently dropped request would strand its
+    /// context on fallback sizing forever.
+    pub dist: Option<Vec<f64>>,
 }
 
 /// How much of the healed token mass may end exactly at the current prefix
@@ -54,6 +58,9 @@ const EXACT_MASS_THRESHOLD: f64 = 0.05;
 const SPECULATE_K: usize = 4;
 /// How far past the crosshair the argmax chain is speculated while idle.
 const SPECULATE_DEPTH: usize = 6;
+/// Queue bound: beyond this the stalest requests are shed with an explicit
+/// "not serviced" reply (never silently — see `FromWorker::dist`).
+const MAX_PENDING: usize = 256;
 /// LLM context window over committed symbols. The window start moves in
 /// `WINDOW_STEP` jumps so branch prefixes stay shareable between jumps.
 const WINDOW: usize = 800;
@@ -107,6 +114,38 @@ impl<'m> Worker<'m> {
             Some(s) => s,
             None => self.evict_lru(src_seq)?,
         };
+        // From here this call owns `seq`: any failure must hand it back to
+        // `free_seqs`, or the branch budget shrinks by one forever and the
+        // worker eventually runs out of sequences entirely.
+        match self.decode_branch(seq, src_seq, tokens, k) {
+            Ok(probs) => {
+                self.tick += 1;
+                self.branches.insert(
+                    tokens.into(),
+                    Branch {
+                        seq,
+                        probs: probs.clone(),
+                        last_used: self.tick,
+                    },
+                );
+                Ok(probs)
+            }
+            Err(e) => {
+                self.free_seqs.push(seq);
+                Err(e)
+            }
+        }
+    }
+
+    /// Fill `seq` with the KV state for `tokens` (prefix copied from
+    /// `src_seq`, tail decoded) and return the next-token distribution.
+    fn decode_branch(
+        &mut self,
+        seq: i32,
+        src_seq: i32,
+        tokens: &[LlamaToken],
+        k: usize,
+    ) -> Result<Arc<[f32]>, String> {
         self.ctx
             .clear_kv_cache_seq(Some(seq as u32), None, None)
             .map_err(|e| format!("kv clear: {e}"))?;
@@ -129,17 +168,7 @@ impl<'m> Worker<'m> {
         self.ctx
             .decode(&mut batch)
             .map_err(|e| format!("decode: {e}"))?;
-        let probs: Arc<[f32]> = softmax(self.ctx.get_logits_ith(batch.n_tokens() - 1)).into();
-        self.tick += 1;
-        self.branches.insert(
-            tokens.into(),
-            Branch {
-                seq,
-                probs: probs.clone(),
-                last_used: self.tick,
-            },
-        );
-        Ok(probs)
+        Ok(softmax(self.ctx.get_logits_ith(batch.n_tokens() - 1)).into())
     }
 
     /// Free the least-recently-used branch (never the pinned preamble at the
@@ -351,7 +380,6 @@ pub fn run(
 
     // Request state: newest-first, hint-adjacent boosted, cancellable.
     let mut pending: Vec<Vec<u8>> = Vec::new();
-    let mut cancelled: HashSet<Vec<u8>> = HashSet::new();
     let mut hint: Vec<u8> = Vec::new();
 
     'main: loop {
@@ -374,13 +402,25 @@ pub fn run(
             };
             match msg {
                 Some(ToWorker::Predict { ctx }) => {
-                    cancelled.remove(&ctx);
-                    pending.push(ctx);
+                    if !pending.contains(&ctx) {
+                        pending.push(ctx);
+                    }
+                    // Shed the stalest work rather than growing without
+                    // bound; the reply lets the adapter re-request later.
+                    while pending.len() > MAX_PENDING {
+                        let old = pending.remove(0);
+                        if tx.send(FromWorker {
+                            ctx: old,
+                            dist: None,
+                        })
+                        .is_err()
+                        {
+                            break 'main;
+                        }
+                    }
                 }
                 Some(ToWorker::Hint { ctx }) => hint = ctx,
-                Some(ToWorker::Cancel { ctx }) => {
-                    cancelled.insert(ctx);
-                }
+                Some(ToWorker::Cancel { ctx }) => pending.retain(|c| c != &ctx),
                 None => break,
             }
         }
@@ -396,16 +436,18 @@ pub fn run(
             });
         if let Some(i) = pick {
             let ctx = pending.remove(i);
-            if cancelled.remove(&ctx) {
-                continue;
-            }
-            match w.compute(&ctx) {
-                Ok(dist) => {
-                    if tx.send(FromWorker { ctx, dist }).is_err() {
-                        break 'main;
-                    }
+            let reply = match w.compute(&ctx) {
+                Ok(dist) => FromWorker {
+                    ctx,
+                    dist: Some(dist),
+                },
+                Err(e) => {
+                    eprintln!("keyb-lm-llama: {e}");
+                    FromWorker { ctx, dist: None }
                 }
-                Err(e) => eprintln!("keyb-lm-llama: {e}"),
+            };
+            if tx.send(reply).is_err() {
+                break 'main;
             }
             continue;
         }
@@ -431,13 +473,14 @@ pub fn run(
                         if tx
                             .send(FromWorker {
                                 ctx: child,
-                                dist: d,
+                                dist: Some(d),
                             })
                             .is_err()
                         {
                             break 'main;
                         }
                     }
+                    // Unsolicited work: no reply owed on failure.
                     Err(e) => eprintln!("keyb-lm-llama: speculate: {e}"),
                 }
                 break 'speculate; // one unit of work, then re-check traffic

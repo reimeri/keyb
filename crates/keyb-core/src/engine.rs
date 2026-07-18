@@ -415,7 +415,7 @@ impl Engine {
             self.speed_bits =
                 (self.speed_bits * self.params.speed_drop).max(self.params.min_bits_per_sec);
         } else if dx_sign > 0 {
-            let grow = (1.0 + self.params.speed_rise_per_sec * dt).powf(1.0);
+            let grow = 1.0 + self.params.speed_rise_per_sec * dt;
             self.speed_bits = (self.speed_bits * grow).min(self.params.max_bits_per_sec);
         }
         if dx_sign != 0 {
@@ -870,11 +870,24 @@ impl Engine {
     fn evict_children(&mut self, i: usize) {
         // Cancel LM work for every expanded node about to disappear (§6.1).
         // Contexts must be computed while parent links are still intact.
-        let mut expanded_ctxs = vec![self.context_of(i)];
+        // A group box adds no character, so it shares its context with the
+        // nearest non-group ancestor — which survives this eviction still
+        // expanded (it must be, for `i` to exist). Releasing that shared
+        // context would cancel an upgrade the ancestor is still waiting on,
+        // stranding it on fallback sizing; skip it and any dying descendants
+        // that share it (the group-only chain under `i`).
+        let shared: Option<Vec<u8>> = self.nodes[i].is_group().then(|| self.context_of(i));
+        let mut expanded_ctxs = match &shared {
+            Some(_) => Vec::new(),
+            None => vec![self.context_of(i)],
+        };
         let mut walk = self.nodes[i].children.clone();
         while let Some(c) = walk.pop() {
             if self.nodes[c].alive && self.nodes[c].expanded {
-                expanded_ctxs.push(self.context_of(c));
+                let ctx = self.context_of(c);
+                if shared.as_ref() != Some(&ctx) {
+                    expanded_ctxs.push(ctx);
+                }
             }
             walk.extend(self.nodes[c].children.iter().copied());
         }
@@ -2018,6 +2031,76 @@ mod tests {
         // Moving forward again replays the exact same text.
         assert!(steer_to(&mut e, &target, 40000), "retype after backtrack");
         assert_eq!(e.committed_text(), "I have");
+    }
+
+    /// Uniform predictions plus a log of every released context.
+    struct ReleaseLog {
+        n: usize,
+        released: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl LanguageModel for ReleaseLog {
+        fn predict(&mut self, _context: &[u8]) -> Vec<f64> {
+            vec![1.0 / self.n as f64; self.n]
+        }
+        fn release(&mut self, context: &[u8]) {
+            self.released.lock().unwrap().push(context.to_vec());
+        }
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    /// Evicting a group box's children must not release the context it shares
+    /// with its (still expanded) non-group ancestor. Regression: releasing it
+    /// cancelled the ancestor's pending distribution upgrade, stranding the
+    /// ancestor on fallback sizing for as long as it stayed on screen.
+    #[test]
+    fn evicting_group_children_keeps_shared_context() {
+        let a = Alphabet::english_full();
+        let n = a.len();
+        let released = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lm = ReleaseLog {
+            n,
+            released: released.clone(),
+        };
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_viewport_px(1000.0);
+        // Expand the root; the group boxes are large enough (uniform model)
+        // to expand too. Root and groups all share the empty context.
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: false,
+            },
+            1.0 / 60.0,
+        );
+        let groups: Vec<usize> = e.nodes[ROOT]
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| e.nodes[c].is_group())
+            .collect();
+        assert!(
+            groups.iter().any(|&g| e.nodes[g].expanded),
+            "at least one group box must have expanded"
+        );
+        // Park the view deep inside 'a': the groups go invisible and their
+        // children are evicted while the root stays expanded.
+        e.view_lo = 0.0001;
+        e.view_hi = 0.0002;
+        e.maintain_tree();
+        assert!(
+            groups.iter().all(|&g| !e.nodes[g].expanded),
+            "groups off-screen must have their children evicted"
+        );
+        assert!(e.nodes[ROOT].expanded, "root must stay expanded");
+        assert!(
+            !released.lock().unwrap().iter().any(|c| c.is_empty()),
+            "the root's context must not be released: {:?}",
+            released.lock().unwrap()
+        );
     }
 
     /// The visible set marks group boxes with a color and their label, and

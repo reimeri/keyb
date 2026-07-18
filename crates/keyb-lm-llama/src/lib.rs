@@ -60,14 +60,18 @@ pub struct LlamaLm {
     n_sym: usize,
     lambda: f64,
     p_min: f64,
-    /// Final (blended, floored) distributions ready to serve synchronously.
+    /// Raw LLM char distributions by context. Blending with PPM happens at
+    /// serve time, so PPM's online learning is never served stale.
     cache: HashMap<Vec<u8>, Vec<f64>>,
     /// Contexts served with fallback sizing, awaiting a worker answer: these
-    /// are the ones the engine must be told to re-partition.
+    /// are the ones the engine must be told to re-partition. Every entry has
+    /// a request in flight — the worker replies exactly once per request
+    /// (even on failure), so entries can never strand.
     pending: HashSet<Vec<u8>>,
     tx: Sender<ToWorker>,
     rx: Receiver<FromWorker>,
     last_hint: Option<Vec<u8>>,
+    worker_gone: bool,
     _worker: std::thread::JoinHandle<()>,
 }
 
@@ -109,6 +113,7 @@ impl LlamaLm {
             tx,
             rx,
             last_hint: None,
+            worker_gone: false,
             _worker: handle,
         })
     }
@@ -131,25 +136,38 @@ impl LlamaLm {
         p
     }
 
-    fn send(&self, msg: ToWorker) {
-        // Bounded channel: shed load rather than stall the frame loop. A
-        // dropped Predict self-heals (the node keeps fallback sizing until a
-        // later request or speculation covers it).
-        if let Err(TrySendError::Disconnected(_)) = self.tx.try_send(msg) {
-            // Worker gone; fallback-only operation from here on.
+    /// Try to hand `msg` to the worker without ever stalling the frame loop.
+    /// Returns whether the message was accepted: callers must not record
+    /// state that assumes delivery (in-flight markers, hint dedup) when it
+    /// wasn't, or a shed message strands that state forever.
+    fn send(&mut self, msg: ToWorker) -> bool {
+        match self.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => false, // shed load; caller retries later
+            Err(TrySendError::Disconnected(_)) => {
+                if !self.worker_gone {
+                    self.worker_gone = true;
+                    eprintln!("keyb-lm-llama: inference worker gone — cached + PPM only from here on");
+                }
+                false
+            }
         }
     }
 }
 
 impl LanguageModel for LlamaLm {
     fn predict(&mut self, context: &[u8]) -> Vec<f64> {
-        if let Some(d) = self.cache.get(context) {
-            return d.clone();
+        if let Some(raw) = self.cache.get(context).cloned() {
+            return self.blend(context, &raw);
         }
-        if self.pending.insert(context.to_vec()) {
-            self.send(ToWorker::Predict {
+        // Mark in-flight only when the request actually reached the queue: a
+        // shed request must stay re-requestable by the next expansion.
+        if !self.pending.contains(context)
+            && self.send(ToWorker::Predict {
                 ctx: context.to_vec(),
-            });
+            })
+        {
+            self.pending.insert(context.to_vec());
         }
         // Deadline missed by definition (nothing cached): PPM alone (§6.3).
         self.ppm.predict(context)
@@ -158,14 +176,21 @@ impl LanguageModel for LlamaLm {
     fn poll_upgrades(&mut self) -> Vec<(Vec<u8>, Vec<f64>)> {
         let mut out = Vec::new();
         while let Ok(FromWorker { ctx, dist }) = self.rx.try_recv() {
-            let blended = self.blend(&ctx, &dist);
-            self.cache.insert(ctx.clone(), blended.clone());
+            let Some(raw) = dist else {
+                // Not serviced (compute failed or the queue shed it): clear
+                // the in-flight marker so a later predict re-requests. The
+                // node keeps fallback sizing meanwhile.
+                self.pending.remove(&ctx);
+                continue;
+            };
             if self.cache.len() > 16384 {
                 self.cache.clear(); // crude cap; worker recomputes cheaply
             }
+            self.cache.insert(ctx.clone(), raw.clone());
             // Only contexts that were actually served with fallback need
             // re-partitioning; speculative answers just warm the cache.
             if self.pending.remove(&ctx) {
+                let blended = self.blend(&ctx, &raw);
                 out.push((ctx, blended));
             }
         }
@@ -176,10 +201,11 @@ impl LanguageModel for LlamaLm {
         if self.last_hint.as_deref() == Some(center_context) {
             return;
         }
-        self.last_hint = Some(center_context.to_vec());
-        self.send(ToWorker::Hint {
+        if self.send(ToWorker::Hint {
             ctx: center_context.to_vec(),
-        });
+        }) {
+            self.last_hint = Some(center_context.to_vec());
+        }
     }
 
     fn release(&mut self, context: &[u8]) {
