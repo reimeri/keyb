@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -28,24 +28,58 @@ struct App {
     core: Core,
     gpu: Gpu,
     state: Option<RenderState>,
+    error: Option<anyhow::Error>,
     /// Borderless bottom-anchored override-redirect strip instead of a
     /// normal window.
     osk: bool,
 }
 
 impl App {
-    fn frame(&mut self) {
-        let Some(state) = &self.state else { return };
+    fn frame(&mut self) -> Result<()> {
+        let Some(state) = &mut self.state else {
+            return Ok(());
+        };
         let size = state.window.inner_size();
         if size.width == 0 || size.height == 0 {
-            return;
+            return Ok(());
         }
         let scale = state.window.scale_factor();
         self.core
             .tick(size.width as f64 / scale, size.height as f64 / scale, scale);
-        let state = self.state.as_ref().expect("checked above");
+        self.gpu.render(
+            &mut state.surface,
+            &self.core.scene,
+            size.width,
+            size.height,
+        )?;
+        Ok(())
+    }
+
+    fn resume(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let window = Arc::new(
+            event_loop
+                .create_window(self.window_attributes(event_loop))
+                .context("create window")?,
+        );
+        let size = window.inner_size();
+        let surface = pollster::block_on(self.gpu.context.create_surface(
+            window.clone(),
+            size.width.max(1),
+            size.height.max(1),
+            vello::wgpu::PresentMode::AutoVsync,
+        ))
+        .context("create render surface")?;
         self.gpu
-            .render(&state.surface, &self.core.scene, size.width, size.height);
+            .ensure_renderer(surface.dev_id, surface.format)
+            .context("initialize renderer")?;
+        self.state = Some(RenderState { surface, window });
+        Ok(())
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.core.engaged = false;
+        self.error = Some(error);
+        event_loop.exit();
     }
 
     /// Left-button press: toggle visibility via the hide button / edge handle,
@@ -113,24 +147,12 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        if self.state.is_some() || self.error.is_some() {
             return;
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(self.window_attributes(event_loop))
-                .expect("create window"),
-        );
-        let size = window.inner_size();
-        let surface = pollster::block_on(self.gpu.context.create_surface(
-            window.clone(),
-            size.width.max(1),
-            size.height.max(1),
-            vello::wgpu::PresentMode::AutoVsync,
-        ))
-        .expect("create surface");
-        self.gpu.ensure_renderer(surface.dev_id, surface.format);
-        self.state = Some(RenderState { surface, window });
+        if let Err(error) = self.resume(event_loop) {
+            self.fail(event_loop, error);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -187,7 +209,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.frame();
+                if let Err(error) = self.frame() {
+                    self.fail(event_loop, error);
+                    return;
+                }
                 if let Some(state) = &self.state {
                     state.window.request_redraw();
                 }
@@ -224,8 +249,12 @@ pub fn run(core: Core, osk: bool) -> Result<()> {
         core,
         gpu: Gpu::new(),
         state: None,
+        error: None,
         osk,
     };
     event_loop.run_app(&mut app)?;
-    Ok(())
+    match app.error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }

@@ -41,7 +41,7 @@ use wayland_client::{
 };
 
 use crate::scene::{hide_button_rect, reset_button_rect};
-use crate::{osk_width, Core, Gpu, HANDLE_H, HANDLE_W};
+use crate::{osk_width, Core, Gpu, RenderOutcome, HANDLE_H, HANDLE_W};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
 const BTN_LEFT: u32 = 0x110;
@@ -104,6 +104,7 @@ struct AppState {
     scale: i32,
     configured: bool,
     exit: bool,
+    render_error: Option<anyhow::Error>,
 }
 
 impl AppState {
@@ -184,13 +185,34 @@ impl AppState {
             .tick(self.width as f64, self.height as f64, self.scale as f64);
         // Ask for the next vsync tick only while visible; the collapsed handle
         // is static, so hidden draws once and the loop goes idle.
-        if self.core.visible {
+        let frame_requested = self.core.visible;
+        if frame_requested {
             let s = self.layer.wl_surface();
             s.frame(qh, s.clone());
         }
         let (pw, ph) = self.physical();
-        let rs = self.render_surface.as_ref().expect("checked above");
-        self.gpu.render(rs, &self.core.scene, pw, ph);
+        let Some(render_surface) = self.render_surface.as_mut() else {
+            return;
+        };
+        let result = self.gpu.render(render_surface, &self.core.scene, pw, ph);
+        match result {
+            Ok(RenderOutcome::Presented) => {}
+            Ok(RenderOutcome::Retry) => {
+                // Frame callbacks take effect on a surface commit. Acquisition
+                // failed before wgpu could commit a buffer, so commit the
+                // callback explicitly to guarantee another draw attempt.
+                let surface = self.layer.wl_surface();
+                if !frame_requested {
+                    surface.frame(qh, surface.clone());
+                }
+                self.layer.commit();
+            }
+            Err(error) => {
+                self.core.engaged = false;
+                self.render_error = Some(error.context("render layer-shell surface"));
+                self.exit = true;
+            }
+        }
     }
 }
 
@@ -426,6 +448,9 @@ pub fn run(core: Core) -> Result<(), LayerError> {
                     anyhow!(e).context("wayland dispatch"),
                 )));
             }
+            if let Some(error) = state.render_error.take() {
+                return Err(Box::new((state.core, error)));
+            }
             if state.exit {
                 return Ok(());
             }
@@ -504,7 +529,12 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
         Ok(s) => s,
         Err(e) => return Err(Box::new((core, anyhow!(e).context("create wgpu surface")))),
     };
-    gpu.ensure_renderer(render_surface.dev_id, render_surface.format);
+    if let Err(error) = gpu.ensure_renderer(render_surface.dev_id, render_surface.format) {
+        return Err(Box::new((
+            core,
+            error.context("initialize layer-shell renderer"),
+        )));
+    }
     Ok((
         AppState {
             core,
@@ -523,6 +553,7 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
             scale: 1,
             configured: false,
             exit: false,
+            render_error: None,
         },
         parts.queue,
     ))

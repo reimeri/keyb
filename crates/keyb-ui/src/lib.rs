@@ -17,7 +17,7 @@ mod winit_shell;
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use keyb_core::{Engine, PointerInput, TextEvent};
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -151,6 +151,29 @@ pub(crate) struct Gpu {
     renderers: Vec<Option<Renderer>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderOutcome {
+    Presented,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceErrorAction {
+    Retry,
+    Reconfigure,
+    Fatal,
+}
+
+fn surface_error_action(error: &vello::wgpu::SurfaceError) -> SurfaceErrorAction {
+    match error {
+        vello::wgpu::SurfaceError::Timeout => SurfaceErrorAction::Retry,
+        vello::wgpu::SurfaceError::Outdated | vello::wgpu::SurfaceError::Lost => {
+            SurfaceErrorAction::Reconfigure
+        }
+        vello::wgpu::SurfaceError::OutOfMemory => SurfaceErrorAction::Fatal,
+    }
+}
+
 impl Gpu {
     pub fn new() -> Self {
         Gpu {
@@ -159,11 +182,15 @@ impl Gpu {
         }
     }
 
-    pub fn ensure_renderer(&mut self, dev_id: usize, format: vello::wgpu::TextureFormat) {
+    pub fn ensure_renderer(
+        &mut self,
+        dev_id: usize,
+        format: vello::wgpu::TextureFormat,
+    ) -> Result<()> {
         self.renderers
             .resize_with(self.context.devices.len().max(dev_id + 1), || None);
-        self.renderers[dev_id].get_or_insert_with(|| {
-            Renderer::new(
+        if self.renderers[dev_id].is_none() {
+            let renderer = Renderer::new(
                 &self.context.devices[dev_id].device,
                 RendererOptions {
                     surface_format: Some(format),
@@ -172,21 +199,40 @@ impl Gpu {
                     num_init_threads: None,
                 },
             )
-            .expect("create renderer")
-        });
+            .context("create vello renderer")?;
+            self.renderers[dev_id] = Some(renderer);
+        }
+        Ok(())
     }
 
-    /// Render `scene` to the surface's current texture. Silently skips an
-    /// outdated swapchain (the next configure/resize fixes it).
-    pub fn render(&mut self, surface: &RenderSurface<'_>, scene: &Scene, w: u32, h: u32) {
-        let device_handle = &self.context.devices[surface.dev_id];
+    /// Render `scene` to the current surface texture. Transient acquisition
+    /// failures are returned as `Retry`; lost/outdated surfaces are
+    /// reconfigured first. Pipeline and memory failures remain explicit.
+    pub fn render(
+        &mut self,
+        surface: &mut RenderSurface<'_>,
+        scene: &Scene,
+        w: u32,
+        h: u32,
+    ) -> Result<RenderOutcome> {
         let surface_texture = match surface.surface.get_current_texture() {
             Ok(t) => t,
-            Err(_) => return,
+            Err(error) => match surface_error_action(&error) {
+                SurfaceErrorAction::Retry => return Ok(RenderOutcome::Retry),
+                SurfaceErrorAction::Reconfigure => {
+                    self.context.resize_surface(surface, w.max(1), h.max(1));
+                    return Ok(RenderOutcome::Retry);
+                }
+                SurfaceErrorAction::Fatal => {
+                    return Err(anyhow::Error::new(error).context("acquire render surface"));
+                }
+            },
         };
-        self.renderers[surface.dev_id]
-            .as_mut()
-            .expect("ensure_renderer ran")
+        let device_handle = &self.context.devices[surface.dev_id];
+        self.renderers
+            .get_mut(surface.dev_id)
+            .and_then(Option::as_mut)
+            .context("renderer was not initialized for the surface device")?
             .render_to_surface(
                 &device_handle.device,
                 &device_handle.queue,
@@ -199,8 +245,35 @@ impl Gpu {
                     antialiasing_method: AaConfig::Area,
                 },
             )
-            .expect("vello render failed");
+            .context("render vello scene")?;
         surface_texture.present();
+        Ok(RenderOutcome::Presented)
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::{surface_error_action, SurfaceErrorAction};
+    use vello::wgpu::SurfaceError;
+
+    #[test]
+    fn surface_errors_have_explicit_recovery_actions() {
+        assert_eq!(
+            surface_error_action(&SurfaceError::Timeout),
+            SurfaceErrorAction::Retry
+        );
+        assert_eq!(
+            surface_error_action(&SurfaceError::Outdated),
+            SurfaceErrorAction::Reconfigure
+        );
+        assert_eq!(
+            surface_error_action(&SurfaceError::Lost),
+            SurfaceErrorAction::Reconfigure
+        );
+        assert_eq!(
+            surface_error_action(&SurfaceError::OutOfMemory),
+            SurfaceErrorAction::Fatal
+        );
     }
 }
 
