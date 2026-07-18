@@ -1,7 +1,0 @@
-# Build environment for keyb-lm-llama (llama.cpp via llama-cpp-sys-2).
-# bindgen needs libclang; the cmake crate needs a cmake binary. Neither is on
-# this machine's default paths (Fedora Silverblue), so point at local installs.
-[env]
-LIBCLANG_PATH = "/opt/rocm/lib/llvm/lib"
-BINDGEN_EXTRA_CLANG_ARGS = "-I/opt/rocm/lib/llvm/lib/clang/22/include"
-CMAKE = "/var/home/toor/db/arch/.local/bin/cmake"
