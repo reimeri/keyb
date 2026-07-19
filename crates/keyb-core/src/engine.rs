@@ -247,6 +247,7 @@ const ROOT: usize = 0;
 const MIN_VIEW_W: f64 = 1e-9;
 const MAX_VIEW_W: f64 = 4.0;
 const COMMITTED_LOOKAHEAD_LEVELS: usize = 8;
+const MAX_EXPANSIONS_PER_MAINTAIN: usize = 64;
 
 /// Copy the alive subtree at `src_idx` into `dst`, mapping coordinates
 /// `x -> offset + x * scale` and re-rooting depths at `depth`. Returns the
@@ -813,16 +814,12 @@ impl Engine {
             self.compact();
         }
         let w = self.view_hi - self.view_lo;
-        let speculative_cap = (self.params.soft_advance_depth + COMMITTED_LOOKAHEAD_LEVELS)
-            .min(self.params.max_depth);
-        // Frame advance requires one node to contain the entire view. Near a
-        // partition boundary that may lag behind commits, so an absolute cap
-        // eventually collides with the committed path and leaves the next
-        // large character box empty. Move the cap with that path instead.
-        let expand_cap = speculative_cap.max(
-            self.committed_tail_depth()
-                .saturating_add(COMMITTED_LOOKAHEAD_LEVELS),
-        );
+        let expand_cap = self.expansion_cap();
+
+        // First collect demand from nodes that already existed when this pass
+        // began. A rendered, screen-large box must not stay childless merely
+        // because it sits beyond the speculative lookahead cap.
+        let mut demand = Vec::new();
         let mut stack = vec![ROOT];
         while let Some(i) = stack.pop() {
             let n = &self.nodes[i];
@@ -838,15 +835,65 @@ impl Engine {
                 } else {
                     stack.extend(self.nodes[i].children.iter().copied());
                 }
-            } else if visible
-                && h_px > self.params.expand_px
-                && depth <= expand_cap
-                && self.nodes.len() < self.params.max_nodes
+            } else if visible && h_px > self.params.expand_px {
+                demand.push((i, h_px));
+            }
+        }
+
+        // Largest targets first. Newly-created children are deliberately not
+        // added to this pass, preventing an arbitrarily confident prediction
+        // chain from consuming the whole arena in one demand sweep.
+        demand.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut expanded_count = 0;
+        for (i, _) in demand {
+            if expanded_count >= MAX_EXPANSIONS_PER_MAINTAIN
+                || self.nodes.len() >= self.params.max_nodes
             {
+                break;
+            }
+            if self.nodes[i].alive && !self.nodes[i].expanded {
                 self.expand(i);
+                expanded_count += 1;
+            }
+        }
+
+        // Then spend the remaining budget on recursive lookahead. Unlike the
+        // demand pass, this may visit children created above, so the depth cap
+        // remains essential here.
+        let mut stack = vec![ROOT];
+        while expanded_count < MAX_EXPANSIONS_PER_MAINTAIN
+            && self.nodes.len() < self.params.max_nodes
+        {
+            let Some(i) = stack.pop() else {
+                break;
+            };
+            let n = &self.nodes[i];
+            if !n.alive || n.hi <= self.view_lo || n.lo >= self.view_hi {
+                continue;
+            }
+            let (lo, hi, depth, expanded) = (n.lo, n.hi, n.depth, n.expanded);
+            let h_px = (hi - lo) / w * self.viewport_px;
+            if expanded {
+                stack.extend(self.nodes[i].children.iter().copied());
+            } else if h_px > self.params.expand_px && depth <= expand_cap {
+                self.expand(i);
+                expanded_count += 1;
                 stack.extend(self.nodes[i].children.iter().copied());
             }
         }
+    }
+
+    fn expansion_cap(&self) -> usize {
+        let speculative_cap = (self.params.soft_advance_depth + COMMITTED_LOOKAHEAD_LEVELS)
+            .min(self.params.max_depth);
+        // Treat the path that would commit on release as current steering
+        // progress. Otherwise releasing can jump this cap several levels and
+        // make previously-blocked boxes appear all at once.
+        let steering_depth = self
+            .release_ready_chars()
+            .last()
+            .map_or_else(|| self.committed_tail_depth(), |&i| self.nodes[i].depth);
+        speculative_cap.max(steering_depth.saturating_add(COMMITTED_LOOKAHEAD_LEVELS))
     }
 
     /// Drop dead arena slots. Geometry is untouched — no visual effect.
@@ -966,6 +1013,32 @@ impl Engine {
             cur = next;
         }
         self.nodes[cur].depth
+    }
+
+    /// Pending character nodes that are already dominant enough to commit if
+    /// steering ended now. Kept separate from the commit operation so tree
+    /// lookahead does not change merely because the mouse button was released.
+    fn release_ready_chars(&self) -> Vec<usize> {
+        let chars: Vec<usize> = self
+            .center_path()
+            .into_iter()
+            .filter(|&i| self.nodes[i].as_char().is_some())
+            .collect();
+        let tail = self.tail_len();
+        if chars.len() <= tail
+            || !chars[..tail]
+                .iter()
+                .map(|&i| self.nodes[i].as_char().expect("filtered to chars"))
+                .eq(self.committed[self.frame_chars..].iter().copied())
+        {
+            return Vec::new();
+        }
+        let min_width = self.params.commit_release_frac * (self.view_hi - self.view_lo);
+        chars[tail..]
+            .iter()
+            .copied()
+            .take_while(|&i| self.nodes[i].hi - self.nodes[i].lo >= min_width)
+            .collect()
     }
 
     /// Chain of nodes (root-child first) that fully contain the view, including
@@ -1118,33 +1191,10 @@ impl Engine {
     /// A no-op while the crosshair path disagrees with the committed tail
     /// (mid-retraction) or nothing yet dominates.
     fn commit_under_crosshair(&mut self) {
-        let w = self.view_hi - self.view_lo;
-        let chars: Vec<usize> = self
-            .center_path()
-            .iter()
-            .copied()
-            .filter(|&i| self.nodes[i].as_char().is_some())
-            .collect();
-        let tail = self.tail_len();
-        if chars.len() <= tail {
-            return;
-        }
-        let on_track = chars[..tail]
-            .iter()
-            .map(|&i| self.nodes[i].as_char().expect("char"))
-            .eq(self.committed[self.frame_chars..].iter().copied());
-        if !on_track {
-            return;
-        }
+        let ready = self.release_ready_chars();
         let mut text = String::new();
-        for &id in &chars[tail..] {
-            let (lo, hi, sym) = {
-                let n = &self.nodes[id];
-                (n.lo, n.hi, n.as_char().expect("char"))
-            };
-            if hi - lo < self.params.commit_release_frac * w {
-                break; // deeper boxes are smaller still; stop at the first misfit
-            }
+        for id in ready {
+            let sym = self.nodes[id].as_char().expect("filtered to chars");
             self.lm.learn(&self.committed, sym);
             self.committed.push(sym);
             text.push(self.alphabet.char_of(sym));
@@ -1923,20 +1973,16 @@ mod tests {
         Engine::new(a, Box::new(UniformModel(n)), EngineParams::default())
     }
 
-    #[test]
-    fn held_steering_expands_box_at_inclusive_limit() {
+    fn pending_chain(depth: usize, lo: f64, hi: f64, committed: usize) -> (Engine, usize) {
         let mut e = engine();
-        // Reproduce the release-sensitive state directly: frame advance has
-        // lagged near a boundary, leaving 15 committed levels and a large
-        // pending frontier exactly at the effective depth limit (24).
         let mut parent = ROOT;
-        for depth in 1..=24 {
+        for depth in 1..=depth {
             let idx = e.nodes.len();
             e.nodes.push(Node {
                 label: NodeLabel::Char(0),
                 opens: e.alphabet.root_layout(),
-                lo: 0.25,
-                hi: 0.75,
+                lo,
+                hi,
                 depth,
                 parent,
                 children: Vec::new(),
@@ -1948,8 +1994,17 @@ mod tests {
             e.nodes[parent].expanded = true;
             parent = idx;
         }
-        let pending_frontier = parent;
-        e.committed = vec![0; 15];
+        e.committed = vec![0; committed];
+        (e, parent)
+    }
+
+    #[test]
+    fn visible_demand_expands_beyond_speculative_cap() {
+        // The pending box is one level beyond the cap, too small to count as
+        // release-ready, but still 90 px tall and already visible to the user.
+        let (mut e, pending_frontier) = pending_chain(25, 0.45, 0.55, 15);
+        assert_eq!(e.expansion_cap(), 24);
+        assert!(e.nodes[pending_frontier].depth > e.expansion_cap());
 
         e.step(
             PointerInput {
@@ -1962,8 +2017,22 @@ mod tests {
 
         assert!(
             e.nodes[pending_frontier].expanded,
-            "the pending frontier must reveal children while the mouse is still held"
+            "an existing screen-large box must expand while the mouse is still held"
         );
+    }
+
+    #[test]
+    fn release_does_not_move_expansion_cap() {
+        // Every pending node occupies half the view, so all ten are exactly the
+        // characters commit_under_crosshair() will land on release.
+        let (mut e, _) = pending_chain(25, 0.25, 0.75, 15);
+        assert_eq!(e.release_ready_chars().len(), 10);
+        let before = e.expansion_cap();
+
+        e.commit_under_crosshair();
+
+        assert_eq!(e.committed.len(), 25);
+        assert_eq!(e.expansion_cap(), before);
     }
 
     /// Sharply peaked deterministic Markov chain over the lowercase letters:
@@ -1994,6 +2063,27 @@ mod tests {
         fn alphabet_len(&self) -> usize {
             self.n
         }
+    }
+
+    #[test]
+    fn expansion_work_is_bounded_per_step() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let mut e = Engine::new(a, Box::new(PeakedModel { n }), EngineParams::default());
+        e.set_viewport_px(900.0);
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: true,
+            },
+            1.0 / 60.0,
+        );
+        let expanded = e.nodes.iter().filter(|n| n.expanded).count();
+        assert!(
+            expanded <= 2 * MAX_EXPANSIONS_PER_MAINTAIN,
+            "two maintenance passes expanded {expanded} nodes"
+        );
     }
 
     /// A human who zooms straight into the dominant box must never end up
