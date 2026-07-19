@@ -84,6 +84,13 @@ impl Core {
     }
 
     pub fn adjust_speed(&mut self, delta: f64) {
+        // Under auto speed control the governor re-derives `speed_bits` every
+        // frame, so a nudge must move its cap or it would be overridden on
+        // the next step.
+        if self.engine.params.adaptive_speed {
+            self.engine.params.max_bits_per_sec =
+                (self.engine.params.max_bits_per_sec + delta).clamp(1.0, 10.0);
+        }
         self.engine.speed_bits = (self.engine.speed_bits + delta).clamp(1.0, 10.0);
     }
 

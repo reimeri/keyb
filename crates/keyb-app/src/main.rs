@@ -112,6 +112,12 @@ fn main() -> Result<()> {
         // before retracting (SPEC §8.3).
         params.retract_eps = 0.10;
     }
+    // Dasher-style auto speed control (SPEC §5.2), opt-in: the cap ramps up
+    // while steering is smooth and is cut on jitter/reversals. Off by default
+    // so the established fixed-speed feel is unchanged.
+    if env_flag("KEYB_ADAPTIVE") {
+        params.adaptive_speed = true;
+    }
 
     let engine = Engine::new(alphabet, lm, params);
     keyb_ui::run(

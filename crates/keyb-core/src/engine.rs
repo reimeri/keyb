@@ -78,10 +78,19 @@ pub struct EngineParams {
     /// stay uncommitted, so pausing mid-word never dumps tiny speculative
     /// descendants into the buffer.
     pub commit_release_frac: f64,
+    /// A release commits only if this much forward zoom (bits) accumulated
+    /// during the engagement being released. A tap — or the frontends'
+    /// pointer-escape fail-safe firing before any real steering — must never
+    /// land text the user only hovered over.
+    pub release_min_zoom_bits: f64,
+    /// Cap on characters a single release may commit. A confident model can
+    /// chain many crosshair-path boxes past `commit_release_frac`; without a
+    /// cap one release dumps the model's whole predicted continuation.
+    pub release_max_chars: usize,
     /// Auto speed control (SPEC §5.2): when true, `speed_bits` rises slowly
     /// while steering is smooth and drops immediately on jitter or a zoom
     /// reversal. Off by default so the oracle harness and unit tests drive
-    /// `speed_bits` directly; keyb-app turns it on from config.
+    /// `speed_bits` directly; keyb-app enables it via `KEYB_ADAPTIVE`.
     pub adaptive_speed: bool,
     /// Floor for the adaptive speed cap (also the novice starting point).
     pub min_bits_per_sec: f64,
@@ -106,6 +115,8 @@ impl Default for EngineParams {
             upgrade_anim_secs: 0.12,
             retract_eps: 0.02,
             commit_release_frac: 0.5,
+            release_min_zoom_bits: 0.25,
+            release_max_chars: 3,
             adaptive_speed: false,
             min_bits_per_sec: 1.5,
             speed_rise_per_sec: 0.35,
@@ -230,6 +241,9 @@ pub struct Engine {
     outside_timer: f64,
     /// Engaged state of the previous `step`, to catch the release edge.
     was_engaged: bool,
+    /// Forward zoom (bits) accumulated during the current engagement; gates
+    /// the release commit so a mere tap never lands text.
+    engaged_zoom_bits: f64,
     /// Previous frame's selection point and zoom sign, for auto speed control.
     prev_y: f64,
     prev_dx_sign: i8,
@@ -312,6 +326,7 @@ impl Engine {
             commit_timer: 0.0,
             outside_timer: 0.0,
             was_engaged: false,
+            engaged_zoom_bits: 0.0,
             prev_y: 0.5,
             prev_dx_sign: 0,
             viewport_px: 800.0,
@@ -341,6 +356,7 @@ impl Engine {
         self.commit_timer = 0.0;
         self.outside_timer = 0.0;
         self.was_engaged = false;
+        self.engaged_zoom_bits = 0.0;
         self.prev_dx_sign = 0;
         self.speed_bits = if self.params.adaptive_speed {
             self.params.min_bits_per_sec
@@ -388,9 +404,13 @@ impl Engine {
     pub fn step(&mut self, input: PointerInput, dt: f64) {
         let dt = dt.clamp(0.0, 0.1);
         if input.engaged {
+            if !self.was_engaged {
+                self.engaged_zoom_bits = 0.0;
+            }
             if self.params.adaptive_speed {
                 self.adapt_speed(input, dt);
             }
+            self.engaged_zoom_bits += self.speed_bits * input.dx.clamp(0.0, 1.0) * dt;
             self.zoom(input, dt);
         }
         self.prev_y = input.y;
@@ -429,7 +449,9 @@ impl Engine {
             0
         };
         // Jitter proxy: lateral speed well above what smooth aiming needs.
-        let jitter = (input.y - self.prev_y).abs() > 0.25;
+        // Per-second (15/s ≈ the old 0.25-per-frame at 60 fps) so the
+        // detector is frame-rate independent.
+        let jitter = (input.y - self.prev_y).abs() > 15.0 * dt;
         let reversed = self.prev_dx_sign != 0 && dx_sign != 0 && dx_sign != self.prev_dx_sign;
         if jitter || reversed {
             self.speed_bits =
@@ -815,10 +837,17 @@ impl Engine {
         }
         let w = self.view_hi - self.view_lo;
         let expand_cap = self.expansion_cap();
+        // The demand pass may overshoot the lookahead cap by a margin — a
+        // rendered, screen-large box must not stay childless merely because
+        // frame advance lagged the committed path near a partition boundary —
+        // but it must not be unbounded: expanded children re-qualify as
+        // "existing demand" on the next frame, so without a ceiling a
+        // confident model deepens the tree every frame until the arena fills
+        // (and expansion stops entirely — boxes vanish again).
+        let demand_cap = expand_cap + COMMITTED_LOOKAHEAD_LEVELS;
 
         // First collect demand from nodes that already existed when this pass
-        // began. A rendered, screen-large box must not stay childless merely
-        // because it sits beyond the speculative lookahead cap.
+        // began.
         let mut demand = Vec::new();
         let mut stack = vec![ROOT];
         while let Some(i) = stack.pop() {
@@ -835,7 +864,7 @@ impl Engine {
                 } else {
                     stack.extend(self.nodes[i].children.iter().copied());
                 }
-            } else if visible && h_px > self.params.expand_px {
+            } else if visible && h_px > self.params.expand_px && depth <= demand_cap {
                 demand.push((i, h_px));
             }
         }
@@ -1038,6 +1067,7 @@ impl Engine {
             .iter()
             .copied()
             .take_while(|&i| self.nodes[i].hi - self.nodes[i].lo >= min_width)
+            .take(self.params.release_max_chars)
             .collect()
     }
 
@@ -1102,8 +1132,19 @@ impl Engine {
 
     /// Does the deepest committed node still hold the view, within the
     /// retraction hysteresis? A missing tree link counts as "no".
+    ///
+    /// Held two ways: the node contains the view (within `retract_eps`), or
+    /// it still covers at least `commit_release_frac` of it. The second arm
+    /// keeps retraction symmetric with the release commit: a box committed on
+    /// release at the release fraction has *not* engulfed the view, and
+    /// without this it sat outside the containment margin, so pausing — or
+    /// even steering deeper into the committed letter — retracted it after
+    /// one debounce period (a spurious backspace in the target app). A real
+    /// undo still works: backing out shrinks the node below the fraction and
+    /// the debounced retraction proceeds as before.
     fn committed_node_holds_view(&self) -> bool {
-        let eps = self.params.retract_eps * (self.view_hi - self.view_lo);
+        let w = self.view_hi - self.view_lo;
+        let eps = self.params.retract_eps * w;
         let mut cur = ROOT;
         for &s in &self.committed[self.frame_chars..] {
             match self.descend_one_char(cur, s) {
@@ -1112,7 +1153,9 @@ impl Engine {
             }
         }
         let n = &self.nodes[cur];
-        n.lo - eps <= self.view_lo && self.view_hi <= n.hi + eps
+        let contains = n.lo - eps <= self.view_lo && self.view_hi <= n.hi + eps;
+        let overlap = (n.hi.min(self.view_hi) - n.lo.max(self.view_lo)).max(0.0);
+        contains || overlap >= self.params.commit_release_frac * w
     }
 
     /// Debounced text watermark, both directions (SPEC §5.2/§8.3): a node
@@ -1189,8 +1232,13 @@ impl Engine {
     /// letting go lands the letter you were steering at. Geometry is untouched,
     /// exactly like a debounced commit — only the watermark and the LM move.
     /// A no-op while the crosshair path disagrees with the committed tail
-    /// (mid-retraction) or nothing yet dominates.
+    /// (mid-retraction), nothing yet dominates, or the engagement never
+    /// actually zoomed (`release_min_zoom_bits`) — a tap, or the frontends'
+    /// pointer-escape fail-safe, must not land hovered-over text.
     fn commit_under_crosshair(&mut self) {
+        if self.engaged_zoom_bits < self.params.release_min_zoom_bits {
+            return;
+        }
         let ready = self.release_ready_chars();
         let mut text = String::new();
         for id in ready {
@@ -2022,17 +2070,34 @@ mod tests {
     }
 
     #[test]
-    fn release_does_not_move_expansion_cap() {
-        // Every pending node occupies half the view, so all ten are exactly the
-        // characters commit_under_crosshair() will land on release.
+    fn release_commit_is_capped_and_barely_moves_expansion_cap() {
+        // Every pending node occupies half the view, so ten qualify by width —
+        // but a single release must only land `release_max_chars` of them, and
+        // tree lookahead must move by at most that much (not jump to the whole
+        // qualifying chain's depth).
         let (mut e, _) = pending_chain(25, 0.25, 0.75, 15);
-        assert_eq!(e.release_ready_chars().len(), 10);
+        e.engaged_zoom_bits = 1.0; // a real engagement preceded this release
+        assert_eq!(e.release_ready_chars().len(), e.params.release_max_chars);
         let before = e.expansion_cap();
 
         e.commit_under_crosshair();
 
-        assert_eq!(e.committed.len(), 25);
-        assert_eq!(e.expansion_cap(), before);
+        assert_eq!(e.committed.len(), 15 + e.params.release_max_chars);
+        assert!(
+            e.expansion_cap() <= before + e.params.release_max_chars,
+            "cap moved {before} -> {}",
+            e.expansion_cap()
+        );
+    }
+
+    #[test]
+    fn release_without_zoom_commits_nothing_even_when_dominant() {
+        // Same dominant chain, but the engagement never zoomed: the release
+        // gate must refuse to commit hovered-over text.
+        let (mut e, _) = pending_chain(25, 0.25, 0.75, 15);
+        assert_eq!(e.engaged_zoom_bits, 0.0);
+        e.commit_under_crosshair();
+        assert_eq!(e.committed.len(), 15, "tap must not land text");
     }
 
     /// Sharply peaked deterministic Markov chain over the lowercase letters:
@@ -2083,6 +2148,223 @@ mod tests {
         assert!(
             expanded <= 2 * MAX_EXPANSIONS_PER_MAINTAIN,
             "two maintenance passes expanded {expanded} nodes"
+        );
+    }
+
+    /// A press-and-release with no steering must never commit, no matter how
+    /// confident the model is about the chain under the resting crosshair.
+    #[test]
+    fn tap_without_steering_commits_nothing() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let mut e = Engine::new(a, Box::new(PeakedModel { n }), EngineParams::default());
+        e.set_viewport_px(800.0);
+        // Idle long enough for lookahead to materialize the confident chain.
+        for _ in 0..240 {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: false,
+                },
+                1.0 / 60.0,
+            );
+        }
+        for engaged in [true, true, false] {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged,
+                },
+                1.0 / 60.0,
+            );
+        }
+        assert!(
+            e.committed_syms().is_empty(),
+            "tap committed {:?}",
+            e.committed_text()
+        );
+    }
+
+    /// Idling over a maximally confident chain must not deepen the tree
+    /// beyond the demand ceiling: expanded children re-qualify as visible
+    /// demand next frame, and without the cap the frontier grows every frame
+    /// until the arena fills and expansion stops entirely.
+    #[test]
+    fn idle_hover_keeps_speculative_depth_bounded() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let mut e = Engine::new(a, Box::new(PeakedModel { n }), EngineParams::default());
+        e.set_viewport_px(800.0);
+        for _ in 0..300 {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: false,
+                },
+                1.0 / 60.0,
+            );
+        }
+        let demand_cap = e.expansion_cap() + COMMITTED_LOOKAHEAD_LEVELS;
+        let max_depth = e
+            .nodes
+            .iter()
+            .filter(|n| n.alive)
+            .map(|n| n.depth)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_depth <= demand_cap + 1,
+            "alive depth {max_depth} exceeds demand ceiling {demand_cap}"
+        );
+        assert!(
+            e.nodes.len() < 4000,
+            "arena grew to {} nodes while idle",
+            e.nodes.len()
+        );
+    }
+
+    /// Context-free distribution: symbol 0 gets `peak`, the rest split the
+    /// remainder — sized so its box can dominate the view (≥ the release
+    /// fraction) without containing it.
+    struct FixedPeak {
+        n: usize,
+        peak: f64,
+    }
+    impl LanguageModel for FixedPeak {
+        fn predict(&mut self, _context: &[u8]) -> Vec<f64> {
+            let mut p = vec![(1.0 - self.peak) / (self.n - 1) as f64; self.n];
+            p[0] = self.peak;
+            p
+        }
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    /// Steer at symbol 0 until its box covers 52–60% of the view without
+    /// containing it, then release. The release commit must land exactly 'a'.
+    /// The peak starts well below the release fraction so reaching the
+    /// dominance window takes real zooming (arming `release_min_zoom_bits`).
+    fn release_commit_engine() -> Engine {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let mut e = Engine::new(
+            a,
+            Box::new(FixedPeak { n, peak: 0.30 }),
+            EngineParams::default(),
+        );
+        e.set_viewport_px(800.0);
+        for _ in 0..2000 {
+            let (lo, hi) = e.path_interval(&[0]);
+            let (vl, vh) = e.view();
+            let w = vh - vl;
+            let contains = lo <= vl && hi >= vh;
+            let box_w = (hi - lo) / w;
+            let y = (((lo + hi) / 2.0 - vl) / w).clamp(0.0, 1.0);
+            if box_w >= 0.52 && box_w < 0.60 && !contains && !e.pending_syms().is_empty() {
+                e.step(
+                    PointerInput {
+                        dx: 0.0,
+                        y,
+                        engaged: false,
+                    },
+                    1.0 / 60.0,
+                );
+                assert_eq!(e.committed_syms(), [0], "release must land the dominant box");
+                return e;
+            }
+            e.step(
+                PointerInput {
+                    dx: 1.0,
+                    y,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
+        }
+        panic!("never reached the dominant-but-not-containing state");
+    }
+
+    /// Regression: a release commit leaves the committed box short of full
+    /// containment; steering onward toward that very letter must not bounce a
+    /// Retract (a backspace in the target app) off the containment-only
+    /// hysteresis.
+    #[test]
+    fn release_commit_survives_forward_steering() {
+        let mut e = release_commit_engine();
+        e.drain_text_events();
+        let mut events = Vec::new();
+        for _ in 0..180 {
+            let (lo, hi) = e.path_interval(&[]);
+            let (vl, vh) = e.view();
+            let w = vh - vl;
+            let y = (((lo + hi) / 2.0 - vl) / w).clamp(0.0, 1.0);
+            e.step(
+                PointerInput {
+                    dx: 1.0,
+                    y,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
+            events.extend(e.drain_text_events());
+        }
+        assert!(
+            !events.iter().any(|ev| matches!(ev, TextEvent::Retract(_))),
+            "steering into the committed letter must not retract it: {events:?}"
+        );
+    }
+
+    /// Regression: pressing the button and holding still after a release
+    /// commit must not slow-drip the committed text back out.
+    #[test]
+    fn release_commit_survives_engaged_pause() {
+        let mut e = release_commit_engine();
+        e.drain_text_events();
+        for _ in 0..180 {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
+        }
+        let events = e.drain_text_events();
+        assert!(
+            !events.iter().any(|ev| matches!(ev, TextEvent::Retract(_))),
+            "an engaged pause after a release commit must not retract: {events:?}"
+        );
+        assert_eq!(e.committed_syms(), [0]);
+    }
+
+    /// The overlap arm of the hysteresis must not break the undo: a genuine
+    /// back-zoom after a release commit still retracts.
+    #[test]
+    fn back_zoom_after_release_commit_still_retracts() {
+        let mut e = release_commit_engine();
+        e.drain_text_events();
+        for _ in 0..600 {
+            e.step(
+                PointerInput {
+                    dx: -1.0,
+                    y: 0.5,
+                    engaged: true,
+                },
+                1.0 / 60.0,
+            );
+            if e.committed_syms().is_empty() {
+                break;
+            }
+        }
+        assert!(
+            e.committed_syms().is_empty(),
+            "back-zoom must still undo a release commit: {:?}",
+            e.committed_text()
         );
     }
 

@@ -242,7 +242,13 @@ impl<'m> Worker<'m> {
         }
         self.computed.insert(ctx.to_vec(), mass.clone());
         if self.computed.len() > 16384 {
-            self.computed.clear(); // crude cap; recompute is cheap and rare
+            // Shed half rather than wiping, so a long session degrades
+            // gradually instead of recomputing everything at once.
+            let mut keep = false;
+            self.computed.retain(|_, _| {
+                keep = !keep;
+                keep
+            });
         }
         Ok(mass)
     }
@@ -267,10 +273,12 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Preamble priming the model toward the register it will predict
-/// (lowercase informal English — the alphabet has no capitals). SPEC §9.
-const PREAMBLE: &str = "what follows is ordinary english text, written in lowercase as \
-someone types it out one letter at a time.\n\n";
+/// Preamble priming the model toward the register it will predict: ordinary
+/// prose with normal capitalization and punctuation — the full alphabet
+/// includes capitals, digits, and symbols behind group boxes, so the prompt
+/// must not steer mass away from them. SPEC §9.
+const PREAMBLE: &str = "What follows is ordinary English text, with normal capitalization \
+and punctuation, as someone types it out one character at a time.\n\n";
 
 pub fn run(
     cfg: LlamaConfig,

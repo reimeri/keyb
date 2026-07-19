@@ -184,7 +184,13 @@ impl LanguageModel for LlamaLm {
                 continue;
             };
             if self.cache.len() > 16384 {
-                self.cache.clear(); // crude cap; worker recomputes cheaply
+                // Shed half rather than wiping: a full clear reverts every
+                // box on screen to fallback sizing at once mid-session.
+                let mut keep = false;
+                self.cache.retain(|_, _| {
+                    keep = !keep;
+                    keep
+                });
             }
             self.cache.insert(ctx.clone(), raw.clone());
             // Only contexts that were actually served with fallback need
