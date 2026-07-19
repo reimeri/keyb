@@ -821,7 +821,7 @@ impl Engine {
         // large character box empty. Move the cap with that path instead.
         let expand_cap = speculative_cap.max(
             self.committed_tail_depth()
-                .saturating_add(COMMITTED_LOOKAHEAD_LEVELS + 1),
+                .saturating_add(COMMITTED_LOOKAHEAD_LEVELS),
         );
         let mut stack = vec![ROOT];
         while let Some(i) = stack.pop() {
@@ -840,7 +840,7 @@ impl Engine {
                 }
             } else if visible
                 && h_px > self.params.expand_px
-                && depth < expand_cap
+                && depth <= expand_cap
                 && self.nodes.len() < self.params.max_nodes
             {
                 self.expand(i);
@@ -1924,20 +1924,19 @@ mod tests {
     }
 
     #[test]
-    fn committed_tail_moves_expansion_limit_past_next_characters() {
+    fn held_steering_expands_box_at_inclusive_limit() {
         let mut e = engine();
-        // Reproduce the reported shape directly: frame advance has lagged near
-        // a boundary, leaving 22 committed levels plus two pending boxes under
-        // the crosshair. The old fixed cap was 24, so the second pending box
-        // stayed large and empty forever.
+        // Reproduce the release-sensitive state directly: frame advance has
+        // lagged near a boundary, leaving 15 committed levels and a large
+        // pending frontier exactly at the effective depth limit (24).
         let mut parent = ROOT;
         for depth in 1..=24 {
             let idx = e.nodes.len();
             e.nodes.push(Node {
                 label: NodeLabel::Char(0),
                 opens: e.alphabet.root_layout(),
-                lo: 0.0,
-                hi: 1.0,
+                lo: 0.25,
+                hi: 0.75,
                 depth,
                 parent,
                 children: Vec::new(),
@@ -1949,14 +1948,21 @@ mod tests {
             e.nodes[parent].expanded = true;
             parent = idx;
         }
-        let second_pending = parent;
-        e.committed = vec![0; 22];
+        let pending_frontier = parent;
+        e.committed = vec![0; 15];
 
-        e.maintain_tree();
+        e.step(
+            PointerInput {
+                dx: 0.0,
+                y: 0.5,
+                engaged: true,
+            },
+            1.0 / 60.0,
+        );
 
         assert!(
-            e.nodes[second_pending].expanded,
-            "the second pending box must reveal children without further zoom"
+            e.nodes[pending_frontier].expanded,
+            "the pending frontier must reveal children while the mouse is still held"
         );
     }
 
