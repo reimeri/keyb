@@ -49,14 +49,15 @@ pub struct EngineParams {
     pub commit_debounce: f64,
     /// Advance the frame once the view is narrower than this fraction of it.
     pub rebase_view_w: f64,
-    /// Advance the frame once the crosshair is contained this many tree levels
+    /// Advance the frame once the whole view is contained this many tree levels
     /// below the frame root, regardless of the view's absolute width. Keeps the
     /// materialized tree shallow so a confident (peaked) model can't drive the
     /// speculative frontier into the `max_depth` wall and strand the crosshair
     /// in a box with no children ("no boxes shown"). Must be < `max_depth`.
     pub soft_advance_depth: usize,
-    /// Expansion depth limit below the current frame root (safety net; the
-    /// pixel thresholds are the real gate).
+    /// Speculative expansion limit below the current frame root. A deeper
+    /// committed tail raises the effective limit enough to keep bounded
+    /// lookahead available, so this can never block continued writing.
     pub max_depth: usize,
     /// Arena size that triggers compaction (dead-node garbage collection).
     pub max_nodes: usize,
@@ -211,6 +212,9 @@ pub struct Engine {
     lm: Box<dyn LanguageModel>,
     pub params: EngineParams,
     nodes: Vec<Node>,
+    /// Unreachable arena entries left by subtree eviction. Tracking this keeps
+    /// compaction decisions off the frame hot path.
+    dead_nodes: usize,
     view_lo: f64,
     view_hi: f64,
     /// Full committed text (leaf symbols). The first `frame_chars` are
@@ -234,11 +238,15 @@ pub struct Engine {
     pub speed_bits: f64,
     /// Committed-text changes since the last `drain_text_events` call.
     events: Vec<TextEvent>,
+    /// Node whose context was last sent to the LM. Node identity is stable
+    /// until a tree rebuild, so unchanged steering avoids rebuilding context.
+    last_frame_hint_node: Option<usize>,
 }
 
 const ROOT: usize = 0;
 const MIN_VIEW_W: f64 = 1e-9;
 const MAX_VIEW_W: f64 = 4.0;
+const COMMITTED_LOOKAHEAD_LEVELS: usize = 8;
 
 /// Copy the alive subtree at `src_idx` into `dst`, mapping coordinates
 /// `x -> offset + x * scale` and re-rooting depths at `depth`. Returns the
@@ -293,6 +301,7 @@ impl Engine {
             lm,
             params,
             nodes: vec![root_node(root)],
+            dead_nodes: 0,
             view_lo: 0.0,
             view_hi: 1.0,
             committed: Vec::new(),
@@ -306,6 +315,7 @@ impl Engine {
             prev_dx_sign: 0,
             viewport_px: 800.0,
             events: Vec::new(),
+            last_frame_hint_node: None,
         }
     }
 
@@ -321,6 +331,7 @@ impl Engine {
             self.lm.unlearn(&self.committed, sym);
         }
         self.nodes = vec![root_node(self.alphabet.root_layout())];
+        self.dead_nodes = 0;
         self.view_lo = 0.0;
         self.view_hi = 1.0;
         self.ledger.clear();
@@ -336,6 +347,7 @@ impl Engine {
             self.params.max_bits_per_sec
         };
         self.events.clear();
+        self.last_frame_hint_node = None;
     }
 
     pub fn set_viewport_px(&mut self, px: f64) {
@@ -348,6 +360,13 @@ impl Engine {
 
     pub fn committed_text(&self) -> String {
         self.alphabet.decode(&self.committed)
+    }
+
+    /// Decode only the suffix needed by bounded UI surfaces such as the
+    /// committed-text ribbon.
+    pub fn committed_tail_text(&self, max_symbols: usize) -> String {
+        let start = self.committed.len().saturating_sub(max_symbols);
+        self.alphabet.decode(&self.committed[start..])
     }
 
     pub fn view(&self) -> (f64, f64) {
@@ -589,8 +608,12 @@ impl Engine {
             .find(|&&i| self.nodes[i].expanded)
             .copied()
             .unwrap_or(ROOT);
+        if self.last_frame_hint_node == Some(deepest_expanded) {
+            return;
+        }
         let ctx = self.context_of(deepest_expanded);
         self.lm.frame_hint(&ctx);
+        self.last_frame_hint_node = Some(deepest_expanded);
     }
 
     fn zoom(&mut self, input: PointerInput, dt: f64) {
@@ -682,6 +705,8 @@ impl Engine {
         }
         dst[ROOT].children = kids;
         self.nodes = dst;
+        self.dead_nodes = 0;
+        self.last_frame_hint_node = None;
         self.view_lo = c_lo + self.view_lo * cw;
         self.view_hi = c_lo + self.view_hi * cw;
         if e.was_char {
@@ -770,6 +795,8 @@ impl Engine {
         dst[ROOT].lo = 0.0;
         dst[ROOT].hi = 1.0;
         self.nodes = dst;
+        self.dead_nodes = 0;
+        self.last_frame_hint_node = None;
         self.view_lo = offset + self.view_lo * scale;
         self.view_hi = offset + self.view_hi * scale;
         if is_leaf {
@@ -781,16 +808,21 @@ impl Engine {
     /// Lazy, screen-driven expansion and eviction (SPEC §5.1). Thresholds are
     /// pixels: screen size *is* cumulative probability × zoom.
     fn maintain_tree(&mut self) {
-        if self.nodes.len() > self.params.max_nodes {
+        let garbage_heavy = self.nodes.len() >= 1024 && self.dead_nodes * 2 >= self.nodes.len();
+        if self.nodes.len() >= self.params.max_nodes || garbage_heavy {
             self.compact();
         }
         let w = self.view_hi - self.view_lo;
-        // No point materializing deeper than where the frame will advance:
-        // once the crosshair is `soft_advance_depth` in, the root descends and
-        // depth resets, so a small lookahead beyond it is all that's ever
-        // seen. Keeping the frontier here (well under `max_depth`) means the
-        // depth wall can never strand a *reachable* box without children.
-        let expand_cap = (self.params.soft_advance_depth + 8).min(self.params.max_depth);
+        let speculative_cap = (self.params.soft_advance_depth + COMMITTED_LOOKAHEAD_LEVELS)
+            .min(self.params.max_depth);
+        // Frame advance requires one node to contain the entire view. Near a
+        // partition boundary that may lag behind commits, so an absolute cap
+        // eventually collides with the committed path and leaves the next
+        // large character box empty. Move the cap with that path instead.
+        let expand_cap = speculative_cap.max(
+            self.committed_tail_depth()
+                .saturating_add(COMMITTED_LOOKAHEAD_LEVELS + 1),
+        );
         let mut stack = vec![ROOT];
         while let Some(i) = stack.pop() {
             let n = &self.nodes[i];
@@ -822,6 +854,8 @@ impl Engine {
         let mut dst = Vec::with_capacity(self.nodes.len() / 2);
         copy_subtree(&self.nodes, ROOT, &mut dst, ROOT, 0, 0.0, 1.0);
         self.nodes = dst;
+        self.dead_nodes = 0;
+        self.last_frame_hint_node = None;
     }
 
     fn expand(&mut self, i: usize) {
@@ -898,7 +932,10 @@ impl Engine {
         self.nodes[i].expanded = false;
         self.nodes[i].anim_target = None;
         while let Some(c) = stack.pop() {
-            self.nodes[c].alive = false;
+            if self.nodes[c].alive {
+                self.nodes[c].alive = false;
+                self.dead_nodes += 1;
+            }
             self.nodes[c].anim_target = None;
             stack.extend(std::mem::take(&mut self.nodes[c].children));
         }
@@ -918,6 +955,17 @@ impl Engine {
         let mut ctx = self.committed[..self.frame_chars].to_vec();
         ctx.extend(path.iter().rev());
         ctx
+    }
+
+    fn committed_tail_depth(&self) -> usize {
+        let mut cur = ROOT;
+        for &sym in &self.committed[self.frame_chars..] {
+            let Some(next) = self.descend_one_char(cur, sym) else {
+                break;
+            };
+            cur = next;
+        }
+        self.nodes[cur].depth
     }
 
     /// Chain of nodes (root-child first) that fully contain the view, including
@@ -1168,34 +1216,34 @@ impl Engine {
         let w = self.view_hi - self.view_lo;
         let path = self.center_path();
         let frame_depth = self.ledger.len();
-        let mut out: Vec<BoxView> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter(|(_, n)| n.alive && n.hi > self.view_lo && n.lo < self.view_hi)
-            .map(|(i, n)| {
-                let (sym, label, group) = match n.label {
-                    NodeLabel::Char(s) => (s, self.alphabet.label(s), None),
-                    NodeLabel::Group(g) => (
-                        0,
-                        self.alphabet.group_label(g),
-                        Some(self.alphabet.group_color(g)),
-                    ),
-                };
-                BoxView {
-                    sym,
-                    label,
-                    group,
-                    id: i,
-                    parent: n.parent,
-                    depth: frame_depth + n.depth,
-                    y0: (n.lo - self.view_lo) / w,
-                    y1: (n.hi - self.view_lo) / w,
-                    on_path: path.contains(&i),
-                }
-            })
-            .collect();
+        let mut out = Vec::new();
+        let mut stack = self.nodes[ROOT].children.clone();
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i];
+            if !n.alive || n.hi <= self.view_lo || n.lo >= self.view_hi {
+                continue;
+            }
+            stack.extend(n.children.iter().copied());
+            let (sym, label, group) = match n.label {
+                NodeLabel::Char(s) => (s, self.alphabet.label(s), None),
+                NodeLabel::Group(g) => (
+                    0,
+                    self.alphabet.group_label(g),
+                    Some(self.alphabet.group_color(g)),
+                ),
+            };
+            out.push(BoxView {
+                sym,
+                label,
+                group,
+                id: i,
+                parent: n.parent,
+                depth: frame_depth + n.depth,
+                y0: (n.lo - self.view_lo) / w,
+                y1: (n.hi - self.view_lo) / w,
+                on_path: path.contains(&i),
+            });
+        }
         out.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.y0.total_cmp(&b.y0)));
         out
     }
@@ -1297,6 +1345,83 @@ mod tests {
             cursor = n.hi;
         }
         assert!((cursor - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn committed_tail_decodes_only_requested_symbols() {
+        let mut e = engine();
+        e.committed = e.alphabet.encode("the quick brown fox");
+        assert_eq!(e.committed_tail_text(3), "fox");
+        assert_eq!(e.committed_tail_text(0), "");
+        assert_eq!(e.committed_tail_text(usize::MAX), "the quick brown fox");
+    }
+
+    struct HintLog {
+        n: usize,
+        hints: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl LanguageModel for HintLog {
+        fn predict(&mut self, _context: &[u8]) -> Vec<f64> {
+            vec![1.0 / self.n as f64; self.n]
+        }
+
+        fn frame_hint(&mut self, context: &[u8]) {
+            self.hints.lock().unwrap().push(context.to_vec());
+        }
+
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    #[test]
+    fn unchanged_center_node_sends_one_frame_hint() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let hints = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut e = Engine::new(
+            a,
+            Box::new(HintLog {
+                n,
+                hints: hints.clone(),
+            }),
+            EngineParams::default(),
+        );
+        for _ in 0..20 {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: false,
+                },
+                1.0 / 60.0,
+            );
+        }
+        assert_eq!(hints.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn garbage_heavy_arena_compacts_before_expanding() {
+        let mut e = engine();
+        for _ in 0..1024 {
+            e.nodes.push(Node {
+                label: NodeLabel::Char(0),
+                opens: e.alphabet.root_layout(),
+                lo: 0.0,
+                hi: 0.0,
+                depth: 1,
+                parent: ROOT,
+                children: Vec::new(),
+                expanded: false,
+                alive: false,
+                anim_target: None,
+            });
+        }
+        e.dead_nodes = 1024;
+        e.maintain_tree();
+        assert!(e.nodes.len() < 1025);
+        assert_eq!(e.dead_nodes, 0);
     }
 
     #[test]
@@ -1798,6 +1923,43 @@ mod tests {
         Engine::new(a, Box::new(UniformModel(n)), EngineParams::default())
     }
 
+    #[test]
+    fn committed_tail_moves_expansion_limit_past_next_characters() {
+        let mut e = engine();
+        // Reproduce the reported shape directly: frame advance has lagged near
+        // a boundary, leaving 22 committed levels plus two pending boxes under
+        // the crosshair. The old fixed cap was 24, so the second pending box
+        // stayed large and empty forever.
+        let mut parent = ROOT;
+        for depth in 1..=24 {
+            let idx = e.nodes.len();
+            e.nodes.push(Node {
+                label: NodeLabel::Char(0),
+                opens: e.alphabet.root_layout(),
+                lo: 0.0,
+                hi: 1.0,
+                depth,
+                parent,
+                children: Vec::new(),
+                expanded: false,
+                alive: true,
+                anim_target: None,
+            });
+            e.nodes[parent].children = vec![idx];
+            e.nodes[parent].expanded = true;
+            parent = idx;
+        }
+        let second_pending = parent;
+        e.committed = vec![0; 22];
+
+        e.maintain_tree();
+
+        assert!(
+            e.nodes[second_pending].expanded,
+            "the second pending box must reveal children without further zoom"
+        );
+    }
+
     /// Sharply peaked deterministic Markov chain over the lowercase letters:
     /// the argmax next letter is a fixed function of the previous one, so the
     /// dominant boxes form one long followable chain — a "hold zoom into the
@@ -1884,6 +2046,34 @@ mod tests {
                         node.depth,
                         h_px,
                         e.committed_syms().len()
+                    );
+                }
+            }
+            // The first two pending characters must have children before the
+            // user zooms fully inside them. Otherwise the ribbon can show a
+            // short preview such as "th" while its final large box is empty.
+            let pending: Vec<usize> = e
+                .center_path()
+                .into_iter()
+                .filter(|&i| e.nodes[i].as_char().is_some())
+                .skip(e.tail_len())
+                .take(2)
+                .collect();
+            for deep in pending {
+                let node = &e.nodes[deep];
+                let h_px = (node.hi - node.lo) / (v_hi - v_lo) * 900.0;
+                let childless = !node.expanded || node.children.iter().all(|&c| !e.nodes[c].alive);
+                if h_px > e.params.expand_px && childless {
+                    panic!(
+                        "wedged at frame {frame}: pending box depth={} h_px={:.0} has no \
+                         children (committed len={}, frame chars={}, tail={}, pending={}, \
+                         max_depth={max_depth}, max_nodes={max_nodes})",
+                        node.depth,
+                        h_px,
+                        e.committed_syms().len(),
+                        e.frame_chars,
+                        e.tail_len(),
+                        e.pending_syms().len()
                     );
                 }
             }

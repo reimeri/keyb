@@ -58,6 +58,7 @@ pub(crate) struct Core {
     pub engine: Engine,
     pub fonts: font::FontAssets,
     pub scene: Scene,
+    ribbon: scene::RibbonCache,
     pub cursor: (f64, f64),
     pub engaged: bool,
     /// Whether the OSK is shown. When false the engine is frozen and only the
@@ -73,6 +74,7 @@ impl Core {
             engine,
             fonts: font::FontAssets::load_system()?,
             scene: Scene::new(),
+            ribbon: scene::RibbonCache::default(),
             cursor: (0.0, 0.0),
             engaged: false,
             visible: true,
@@ -134,11 +136,10 @@ impl Core {
 
         scene::build(
             &mut self.scene,
+            &mut self.ribbon,
             &self.engine,
             &self.fonts,
-            lw,
-            lh,
-            scale,
+            (lw, lh, scale),
             input,
             self.cursor,
         );

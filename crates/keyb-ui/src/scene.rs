@@ -49,6 +49,15 @@ struct BoxDraw {
     x0: f64,
 }
 
+#[derive(Default)]
+pub(crate) struct RibbonCache {
+    committed: String,
+    committed_glyphs: Vec<Glyph>,
+    committed_advance: f32,
+    pending: String,
+    pending_glyphs: Vec<Glyph>,
+}
+
 /// Left edge (`x0`, logical px) for each box, widened bottom-up so a box's
 /// label strip is never covered by its largest child. `boxes` must be
 /// depth-sorted ascending (as `Engine::visible` returns); each tuple is
@@ -86,14 +95,14 @@ fn box_left_edges(boxes: &[(usize, usize, f64, f64, bool)], lw: f64) -> Vec<f64>
 
 pub fn build(
     scene: &mut Scene,
+    ribbon: &mut RibbonCache,
     engine: &Engine,
     fonts: &FontAssets,
-    lw: f64,
-    lh: f64,
-    scale: f64,
+    viewport: (f64, f64, f64),
     input: PointerInput,
     cursor: (f64, f64),
 ) {
+    let (lw, lh, scale) = viewport;
     // Everything is laid out in logical px, then scaled once to physical.
     let t = Affine::scale(scale);
     let canvas_h = lh - RIBBON_H;
@@ -240,30 +249,31 @@ pub fn build(
         &Rect::new(0.0, 0.0, lw, RIBBON_H),
     );
     let font_px = 26.0f32;
-    let text = engine.committed_text();
     // Pending preview: text under the crosshair that will commit if the user
     // keeps steering here — shown dim past the caret so letters appear the
     // instant they are steered over, not only after the commit debounce.
     let pending: String = engine.pending_text().chars().take(24).collect();
     let max_chars = ((lw - 60.0) / (font_px as f64 * 0.6)).max(4.0) as usize;
     let budget = max_chars.saturating_sub(pending.chars().count()).max(4);
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(budget)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let shown = tail.replace(' ', "\u{2423}"); // make spaces visible in the ribbon
-    let (glyphs, adv) = fonts.layout(&shown, font_px);
+    let shown = engine.committed_tail_text(budget).replace(' ', "\u{2423}");
+    if ribbon.committed != shown {
+        ribbon.committed = shown;
+        (ribbon.committed_glyphs, ribbon.committed_advance) =
+            fonts.layout(&ribbon.committed, font_px);
+    }
+    let shown_pending = pending.replace(' ', "\u{2423}");
+    if ribbon.pending != shown_pending {
+        ribbon.pending = shown_pending;
+        (ribbon.pending_glyphs, _) = fonts.layout(&ribbon.pending, font_px);
+    }
+    let adv = ribbon.committed_advance;
     let baseline = RIBBON_H * 0.68;
     scene
         .draw_glyphs(&fonts.font)
         .font_size(font_px)
         .transform(t * Affine::translate((16.0, baseline)))
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
-        .draw(Fill::NonZero, glyphs.into_iter());
+        .draw(Fill::NonZero, ribbon.committed_glyphs.iter().copied());
     scene.fill(
         Fill::NonZero,
         t,
@@ -276,14 +286,13 @@ pub fn build(
             baseline + font_px as f64 * 0.15,
         ),
     );
-    if !pending.is_empty() {
-        let (glyphs, _) = fonts.layout(&pending.replace(' ', "\u{2423}"), font_px);
+    if !ribbon.pending.is_empty() {
         scene
             .draw_glyphs(&fonts.font)
             .font_size(font_px)
             .transform(t * Affine::translate((16.0 + adv as f64 + 12.0, baseline)))
             .brush(Color::from_rgb8(0x6E, 0x76, 0x92))
-            .draw(Fill::NonZero, glyphs.into_iter());
+            .draw(Fill::NonZero, ribbon.pending_glyphs.iter().copied());
     }
 
     // Hide button: an `×` in the ribbon's top-right corner (drawn on top of the
