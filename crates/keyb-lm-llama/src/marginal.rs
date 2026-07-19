@@ -21,6 +21,7 @@ pub struct VocabIndex {
     /// tokens sharing a symbol prefix form one contiguous range.
     sorted: Vec<u32>,
     n_sym: usize,
+    max_tok_syms: usize,
 }
 
 impl VocabIndex {
@@ -46,17 +47,14 @@ impl VocabIndex {
             .filter(|&t| !tok_syms[t as usize].is_empty())
             .collect();
         sorted.sort_by(|&a, &b| tok_syms[a as usize].cmp(&tok_syms[b as usize]));
+        let max_tok_syms = tok_syms.iter().map(|s| s.len()).max().unwrap_or(0);
         VocabIndex {
             tok_syms,
             tok_full,
             sorted,
             n_sym: alphabet.len(),
+            max_tok_syms,
         }
-    }
-
-    /// Symbols of token `t` (truncated at the first out-of-alphabet byte).
-    pub fn syms_of(&self, t: u32) -> &[u8] {
-        &self.tok_syms[t as usize]
     }
 
     /// Contiguous `sorted` range of tokens whose symbols start with `s`.
@@ -70,6 +68,52 @@ impl VocabIndex {
             ts[..k] <= s[..k]
         });
         (lo, hi)
+    }
+
+    /// Earliest canonical token boundary whose decoded suffix can still be
+    /// one vocabulary token. BPE tokenization is not prefix-stable: for
+    /// example, `" tryin"` may tokenize as `" try" + "in"`, while the
+    /// predicted completion `" trying"` is one token. Healing from this
+    /// wider boundary keeps that original token path alive.
+    pub fn healing_suffix(&self, tokens: &[u32]) -> (usize, Vec<u8>) {
+        if tokens.is_empty() {
+            return (0, Vec::new());
+        }
+        let mut candidate = Vec::new();
+        let mut best = (tokens.len() - 1, Vec::new());
+        for i in (0..tokens.len()).rev() {
+            let t = tokens[i] as usize;
+            if !self.tok_full[t] || self.tok_syms[t].len() + candidate.len() > self.max_tok_syms {
+                break;
+            }
+            let mut wider = Vec::with_capacity(self.tok_syms[t].len() + candidate.len());
+            wider.extend_from_slice(&self.tok_syms[t]);
+            wider.extend_from_slice(&candidate);
+            candidate = wider;
+            let (lo, hi) = self.prefix_range(&candidate);
+            if self.sorted[lo..hi].iter().any(|&id| {
+                let syms = &self.tok_syms[id as usize];
+                syms.len() > candidate.len()
+                    || (syms.len() == candidate.len() && self.tok_full[id as usize])
+            }) {
+                best = (i, candidate.clone());
+            }
+        }
+        if best.1.is_empty() {
+            let t = tokens[tokens.len() - 1] as usize;
+            best.1.extend_from_slice(&self.tok_syms[t]);
+        }
+        best
+    }
+
+    /// Fully alphabet-representable token ids whose complete piece is `s`.
+    pub fn exact_tokens(&self, s: &[u8]) -> Vec<u32> {
+        let (lo, hi) = self.prefix_range(s);
+        self.sorted[lo..hi]
+            .iter()
+            .copied()
+            .filter(|&t| self.tok_full[t as usize] && self.tok_syms[t as usize].as_ref() == s)
+            .collect()
     }
 
     /// Marginalize `probs` (a next-token distribution, indexed by token id)
@@ -146,6 +190,29 @@ mod tests {
         // "<eos>" starts with '<' — outside the alphabet, dropped.
         let total: f64 = cont.iter().sum();
         assert!((total - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn healing_suffix_rolls_back_across_unstable_tokenization() {
+        let (v, a) = vocab(&[" try", "in", " trying", " tryin", "tryin\u{00ff}"]);
+        let (split, suffix) = v.healing_suffix(&[0, 1]);
+        assert_eq!(split, 0);
+        assert_eq!(suffix, a.encode(" tryin"));
+        assert_eq!(v.exact_tokens(&suffix), vec![3]);
+    }
+
+    #[test]
+    fn healing_suffix_keeps_last_token_when_no_wider_token_matches() {
+        let (v, a) = vocab(&[" uncommon", "word", "other"]);
+        let (split, suffix) = v.healing_suffix(&[0, 1]);
+        assert_eq!(split, 1);
+        assert_eq!(suffix, a.encode("word"));
+    }
+
+    #[test]
+    fn exact_tokens_include_duplicate_pieces_but_not_invalid_tails() {
+        let (v, a) = vocab(&["in", "in", "ing", "in\u{00ff}"]);
+        assert_eq!(v.exact_tokens(&a.encode("in")), vec![0, 1]);
     }
 
     /// Exhaustive cross-check (SPEC §11): trie masses equal summed token

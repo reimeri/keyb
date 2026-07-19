@@ -71,6 +71,25 @@ fn llm_beats_uniform_on_obvious_continuations() {
 }
 
 #[test]
+fn healing_preserves_tokens_that_span_canonical_boundaries() {
+    let Some((mut lm, alphabet)) = lm_or_skip() else {
+        return;
+    };
+    for text in ["hey, what are you doing? i'm tryin", "i'm goin"] {
+        let ctx = alphabet.encode(text);
+        let dist = upgraded(&mut lm, &ctx, Duration::from_secs(10));
+        let g = dist[alphabet.index_of('g').unwrap() as usize];
+        let space = dist[alphabet.index_of(' ').unwrap() as usize];
+        let apostrophe = dist[alphabet.index_of('\'').unwrap() as usize];
+        eprintln!("{text:?}: g={g:.4} space={space:.4} apostrophe={apostrophe:.4}");
+        assert!(
+            g > 0.8 && g > 20.0 * space && g > 20.0 * apostrophe,
+            "{text:?}: g={g} space={space} apostrophe={apostrophe}"
+        );
+    }
+}
+
+#[test]
 fn request_to_upgrade_latency_within_budget() {
     let Some((mut lm, alphabet)) = lm_or_skip() else {
         return;

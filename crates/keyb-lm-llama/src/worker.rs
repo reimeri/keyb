@@ -195,9 +195,9 @@ impl<'m> Worker<'m> {
         self.alphabet.decode(&syms[start..])
     }
 
-    /// P(next char | ctx) from the LLM alone (SPEC §6.2): tokenize, split
-    /// off the intra-token suffix, heal against the boundary branch, and
-    /// resolve significant exact-boundary mass with the next branch.
+    /// P(next char | ctx) from the LLM alone (SPEC §6.2): roll back to the
+    /// earliest token boundary that can heal the current suffix, then resolve
+    /// significant exact-token mass through those tokens' actual branches.
     fn compute(&mut self, ctx: &[u8]) -> Result<Vec<f64>, String> {
         if let Some(d) = self.computed.get(ctx) {
             return Ok(d.clone());
@@ -210,20 +210,27 @@ impl<'m> Worker<'m> {
                 .str_to_token(&text, AddBos::Never)
                 .map_err(|e| format!("tokenize: {e}"))?
         };
-        let (prefix_toks, s) = match tokens.split_last() {
-            Some((&last, prefix)) => (prefix, self.vocab.syms_of(last.0 as u32).to_vec()),
-            None => (&tokens[..], Vec::new()),
-        };
+        let token_ids: Vec<u32> = tokens.iter().map(|t| t.0 as u32).collect();
+        let (split, s) = self.vocab.healing_suffix(&token_ids);
+        let prefix_toks = &tokens[..split];
         let probs_a = self.ensure_branch2(prefix_toks)?;
         let (mut mass, exact) = self.vocab.char_masses(&probs_a, &s);
         let cont: f64 = mass.iter().sum();
         if exact > EXACT_MASS_THRESHOLD * (exact + cont) && !tokens.is_empty() {
-            let probs_b = self.ensure_branch2(&tokens)?;
-            let (root, _) = self.vocab.char_masses(&probs_b, &[]);
-            let root_sum: f64 = root.iter().sum();
-            if root_sum > 0.0 {
-                for (m, r) in mass.iter_mut().zip(&root) {
-                    *m += exact * r / root_sum;
+            for exact_id in self.vocab.exact_tokens(&s) {
+                let token_mass = probs_a[exact_id as usize] as f64;
+                if token_mass == 0.0 {
+                    continue;
+                }
+                let mut exact_branch = prefix_toks.to_vec();
+                exact_branch.push(LlamaToken(exact_id as i32));
+                let probs_b = self.ensure_branch2(&exact_branch)?;
+                let (root, _) = self.vocab.char_masses(&probs_b, &[]);
+                let root_sum: f64 = root.iter().sum();
+                if root_sum > 0.0 {
+                    for (m, r) in mass.iter_mut().zip(&root) {
+                        *m += token_mass * r / root_sum;
+                    }
                 }
             }
         }
@@ -306,7 +313,7 @@ pub fn run(
         .with_n_threads(cfg.n_threads)
         .with_n_threads_batch(cfg.n_threads)
         .with_no_perf(true);
-    let ctx = match model.new_context(&backend, ctx_params) {
+    let ctx = match model.new_context(backend, ctx_params) {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(format!("context: {e}")));
@@ -409,11 +416,12 @@ pub fn run(
                     // bound; the reply lets the adapter re-request later.
                     while pending.len() > MAX_PENDING {
                         let old = pending.remove(0);
-                        if tx.send(FromWorker {
-                            ctx: old,
-                            dist: None,
-                        })
-                        .is_err()
+                        if tx
+                            .send(FromWorker {
+                                ctx: old,
+                                dist: None,
+                            })
+                            .is_err()
                         {
                             break 'main;
                         }
