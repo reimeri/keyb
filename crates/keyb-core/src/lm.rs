@@ -16,6 +16,17 @@ pub trait LanguageModel: Send {
     /// implementations can restore their state exactly.
     fn unlearn(&mut self, _context: &[u8], _sym: u8) {}
 
+    /// Signal that `sym` after `context` was genuinely committed by the user
+    /// (paired with a `TextEvent::Commit`), as opposed to the reversible
+    /// `learn` bookkeeping. Unlike `learn`/`unlearn`, this is *not* emitted by
+    /// `Engine::reset`, so persistent personalization layers can key long-term
+    /// user-vocabulary adaptation off it and survive resets.
+    fn note_commit(&mut self, _context: &[u8], _sym: u8) {}
+
+    /// Signal that a previously `note_commit`ted `sym` was retracted by the
+    /// user (paired with a `TextEvent::Retract`). Reset never emits this.
+    fn note_retract(&mut self, _context: &[u8], _sym: u8) {}
+
     /// Distributions that arrived asynchronously since the last call, as
     /// (context, distribution) pairs. `predict` may answer with a fallback
     /// (SPEC §6.3); when the real distribution lands, the engine re-partitions
@@ -49,6 +60,14 @@ impl<L: LanguageModel + ?Sized> LanguageModel for Box<L> {
 
     fn unlearn(&mut self, context: &[u8], sym: u8) {
         (**self).unlearn(context, sym);
+    }
+
+    fn note_commit(&mut self, context: &[u8], sym: u8) {
+        (**self).note_commit(context, sym);
+    }
+
+    fn note_retract(&mut self, context: &[u8], sym: u8) {
+        (**self).note_retract(context, sym);
     }
 
     fn poll_upgrades(&mut self) -> Vec<(Vec<u8>, Vec<f64>)> {

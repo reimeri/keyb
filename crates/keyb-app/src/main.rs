@@ -2,8 +2,9 @@ use anyhow::Result;
 use keyb_core::{Alphabet, Engine, EngineParams, LanguageModel, TextEvent};
 use keyb_inject::{Injector, RetractionLedger};
 use keyb_lm_llama::{LlamaConfig, LlamaLm};
-use keyb_lm_ppm::PpmModel;
+use keyb_lm_ppm::{Personalized, PpmModel};
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 mod model_download;
 
@@ -20,6 +21,17 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+/// `$XDG_DATA_HOME/keyb/user_model.v1.bin` — the persistent user-vocabulary
+/// store, alongside the downloaded models (SPEC §9). Same base-dir resolution
+/// as `keyb_lm_llama::default_model_path`.
+fn user_model_path() -> PathBuf {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_default();
+    data.join("keyb/user_model.v1.bin")
 }
 
 /// Provision and load the default LLM (`KEYB_MODEL` selects a user-managed
@@ -90,7 +102,18 @@ fn main() -> Result<()> {
     // The full alphabet groups capitals, digits, and symbols under expandable
     // boxes (SPEC §5.4); its first 30 leaves match english_v1 exactly.
     let alphabet = Alphabet::english_full();
-    let lm = language_model(&alphabet);
+    // Wrap the base model in the persistent, decaying user-vocabulary layer so
+    // words the user actually types get easier to enter over time (and fade
+    // once unused). Opt out with KEYB_NO_PERSONALIZE.
+    let lm: Box<dyn LanguageModel> = if env_flag("KEYB_NO_PERSONALIZE") {
+        language_model(&alphabet)
+    } else {
+        Box::new(Personalized::load_or_new(
+            alphabet.len(),
+            language_model(&alphabet),
+            user_model_path(),
+        ))
+    };
 
     let chars: Vec<char> = (0..alphabet.len() as u8)
         .map(|s| alphabet.char_of(s))

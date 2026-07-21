@@ -792,6 +792,7 @@ impl Engine {
                 // now so the frame can advance and depth stays bounded; a
                 // back-zoom still retracts it through the ledger.
                 self.lm.learn(&self.committed, sym);
+                self.lm.note_commit(&self.committed, sym);
                 self.committed.push(sym);
                 self.events
                     .push(TextEvent::Commit(self.alphabet.char_of(sym).to_string()));
@@ -1196,6 +1197,7 @@ impl Engine {
             for &id in &chars[tail..] {
                 let sym = self.nodes[id].as_char().expect("char");
                 self.lm.learn(&self.committed, sym);
+                self.lm.note_commit(&self.committed, sym);
                 self.committed.push(sym);
                 text.push(self.alphabet.char_of(sym));
             }
@@ -1222,6 +1224,7 @@ impl Engine {
             self.outside_timer = 0.0;
             let sym = self.committed.pop().expect("tail > 0 when off track");
             self.lm.unlearn(&self.committed, sym);
+            self.lm.note_retract(&self.committed, sym);
             self.events
                 .push(TextEvent::Retract(self.alphabet.char_of(sym).to_string()));
         }
@@ -1244,6 +1247,7 @@ impl Engine {
         for id in ready {
             let sym = self.nodes[id].as_char().expect("filtered to chars");
             self.lm.learn(&self.committed, sym);
+            self.lm.note_commit(&self.committed, sym);
             self.committed.push(sym);
             text.push(self.alphabet.char_of(sym));
         }
@@ -1944,9 +1948,30 @@ mod tests {
     /// Records every learn/unlearn as a signed count per (context, sym) in a
     /// shared map, so a balanced session leaves all counts at zero. Predictions
     /// stay uniform.
+    type Tally = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(Vec<u8>, u8), i64>>>;
+
     struct CountingModel {
         n: usize,
-        counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(Vec<u8>, u8), i64>>>,
+        counts: Tally,
+        /// Signed tally of `note_commit`/`note_retract`, the persistent
+        /// personalization signal. Reset must never touch this.
+        notes: Tally,
+    }
+
+    impl CountingModel {
+        fn new(n: usize) -> (Self, Tally, Tally) {
+            let counts: Tally = Default::default();
+            let notes: Tally = Default::default();
+            (
+                CountingModel {
+                    n,
+                    counts: counts.clone(),
+                    notes: notes.clone(),
+                },
+                counts,
+                notes,
+            )
+        }
     }
 
     impl LanguageModel for CountingModel {
@@ -1969,6 +1994,22 @@ mod tests {
                 .entry((context.to_vec(), sym))
                 .or_default() -= 1;
         }
+        fn note_commit(&mut self, context: &[u8], sym: u8) {
+            *self
+                .notes
+                .lock()
+                .unwrap()
+                .entry((context.to_vec(), sym))
+                .or_default() += 1;
+        }
+        fn note_retract(&mut self, context: &[u8], sym: u8) {
+            *self
+                .notes
+                .lock()
+                .unwrap()
+                .entry((context.to_vec(), sym))
+                .or_default() -= 1;
+        }
         fn alphabet_len(&self) -> usize {
             self.n
         }
@@ -1978,11 +2019,7 @@ mod tests {
     fn reset_clears_state_and_rewinds_lm() {
         let a = Alphabet::english_v1();
         let n = a.len();
-        let counts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let lm = CountingModel {
-            n,
-            counts: counts.clone(),
-        };
+        let (lm, counts, _notes) = CountingModel::new(n);
         let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
         e.set_viewport_px(1000.0);
         e.speed_bits = 8.0;
@@ -2012,6 +2049,40 @@ mod tests {
         assert!(
             counts.lock().unwrap().values().all(|&c| c == 0),
             "reset must unlearn every commit, leaving the LM at baseline"
+        );
+    }
+
+    /// The persistent personalization signal (`note_commit`) fires on genuine
+    /// commits, and — unlike `learn`/`unlearn` — `reset` must NOT undo it, so a
+    /// persistent user-vocabulary layer survives resets.
+    #[test]
+    fn note_commit_survives_reset() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let (lm, counts, notes) = CountingModel::new(n);
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_viewport_px(1000.0);
+        e.speed_bits = 8.0;
+        e.params.rebase_view_w = 0.5;
+        assert!(steer_to(&mut e, &[1, 0, 2], 3000), "should write 'bac'");
+        assert!(!e.committed_syms().is_empty());
+        let notes_after_commit: i64 = notes.lock().unwrap().values().sum();
+        assert!(
+            notes_after_commit > 0,
+            "committing must emit note_commit for the persistent layer"
+        );
+        e.drain_text_events();
+
+        e.reset();
+
+        assert!(
+            counts.lock().unwrap().values().all(|&c| c == 0),
+            "reset rewinds the reversible learn/unlearn state"
+        );
+        assert_eq!(
+            notes.lock().unwrap().values().sum::<i64>(),
+            notes_after_commit,
+            "reset must NOT touch the persistent note_commit signal"
         );
     }
 

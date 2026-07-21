@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 use keyb_core::{Alphabet, LanguageModel};
 
+pub mod user;
+pub use user::{Personalized, UserModel};
+
 const SEED_CORPUS: &str = include_str!("../assets/seed.txt");
 
 struct Counts {
