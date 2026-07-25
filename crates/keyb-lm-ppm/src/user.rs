@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyb_core::LanguageModel;
@@ -331,19 +332,48 @@ impl UserModel {
         Some(m)
     }
 
-    /// Serialize atomically (temp file + rename), creating parent dirs.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            self.write_to(&mut f)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+    /// Serialize into memory. Cheap and pure — no syscalls — so the frame
+    /// thread can produce a snapshot and hand it to [`SaveWorker`] without
+    /// touching the filesystem. ~0.3 ms for a session-sized model (~17k
+    /// committed characters, ~74 kB).
+    ///
+    /// Buffering is not incidental: `write_to` emits one call per field and two
+    /// per stored symbol, so serializing straight into a `File` cost hundreds
+    /// of thousands of `write` syscalls — measured at ~62 ms of the ~72 ms a
+    /// save used to take, dwarfing even `sync_all`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // Header + a generous per-context estimate; growth is amortized anyway.
+        let mut buf = Vec::with_capacity(32 + self.contexts.len() * 48);
+        self.write_to(&mut buf)
+            .expect("writing to a Vec is infallible");
+        buf
     }
+
+    /// Serialize atomically (temp file + rename), creating parent dirs.
+    ///
+    /// Blocks on `sync_all`: ~9 ms on btrfs, and unbounded on a loaded or slow
+    /// disk. That is over the 8 ms frame budget on its own, so this must not be
+    /// called from the frame loop — [`Personalized`] goes through
+    /// [`SaveWorker`] instead.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        write_atomically(path, &self.to_bytes())
+    }
+}
+
+/// Write `bytes` to `path` atomically (temp file + fsync + rename), creating
+/// parent dirs. `sync_all` dominates and scales with the filesystem, not the
+/// payload; callers on a latency budget run this off-thread.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 fn read_u16(r: &mut &[u8]) -> Option<u16> {
@@ -380,6 +410,108 @@ const SAVE_EVERY_COMMITS: u32 = 64;
 /// Default weight of the user model in the blend, before per-context scaling.
 pub const DEFAULT_LAMBDA_USER: f64 = 0.15;
 
+#[derive(Default)]
+struct SlotState {
+    /// Newest serialized snapshot not yet on disk.
+    pending: Option<Vec<u8>>,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+struct SaveSlot {
+    state: Mutex<SlotState>,
+    ready: Condvar,
+}
+
+/// Off-thread persistence for the user model.
+///
+/// `note_commit` runs inside `Engine::step`, on the render thread. Saving there
+/// blocked it for ~72 ms on btrfs once every `SAVE_EVERY_COMMITS` characters —
+/// a visible stutter every few words, nine times the 8 ms frame budget
+/// (SPEC §10). Buffering serialization (see [`UserModel::to_bytes`]) removed
+/// ~62 ms of that, but the remaining `sync_all` still costs ~9 ms and grows
+/// with disk load, so it cannot stay on the frame loop either. The frame thread
+/// now only *serializes* (pure, in-memory, ~0.3 ms) and leaves the bytes here;
+/// this thread does the file I/O.
+///
+/// The mailbox holds exactly one snapshot and is latest-wins: a snapshot that
+/// has not been written yet is simply replaced. A disk slower than the typing
+/// rate therefore costs staleness, never queue growth and never back-pressure
+/// onto steering.
+struct SaveWorker {
+    slot: Arc<SaveSlot>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SaveWorker {
+    /// Spawn the writer for `path`. `None` if the thread can't be spawned, in
+    /// which case the caller saves inline rather than losing the data.
+    fn spawn(path: PathBuf) -> Option<Self> {
+        let slot = Arc::new(SaveSlot::default());
+        let worker_slot = Arc::clone(&slot);
+        let handle = std::thread::Builder::new()
+            .name("keyb-user-model".into())
+            .spawn(move || run_saver(&path, &worker_slot))
+            .map_err(|e| eprintln!("keyb: user-vocabulary writer thread: {e}"))
+            .ok()?;
+        Some(SaveWorker {
+            slot,
+            handle: Some(handle),
+        })
+    }
+
+    /// Hand over a snapshot, replacing any still-unwritten one. Never blocks on
+    /// I/O — only on the (uncontended, I/O-free) mailbox lock.
+    fn submit(&self, bytes: Vec<u8>) {
+        let mut state = lock(&self.slot.state);
+        state.pending = Some(bytes);
+        drop(state);
+        self.slot.ready.notify_one();
+    }
+}
+
+impl Drop for SaveWorker {
+    /// Drain and join, so the final snapshot is durably on disk before the
+    /// process exits.
+    fn drop(&mut self) {
+        lock(&self.slot.state).shutdown = true;
+        self.slot.ready.notify_one();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A poisoned mailbox mutex carries no invariant worth honoring — the guarded
+/// state is one `Option<Vec<u8>>` — so recover rather than propagate a panic
+/// into the frame loop.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn run_saver(path: &Path, slot: &SaveSlot) {
+    // Report a failing disk once; an OSK that reprints every 64 characters is
+    // worse than one that stays quiet.
+    let mut reported = false;
+    loop {
+        let mut state = lock(&slot.state);
+        while state.pending.is_none() && !state.shutdown {
+            state = slot.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        // Take the snapshot before honoring shutdown, so the final save lands.
+        let Some(bytes) = state.pending.take() else {
+            return; // shutdown with nothing left to write
+        };
+        drop(state);
+        if let Err(e) = write_atomically(path, &bytes) {
+            if !reported {
+                reported = true;
+                eprintln!("keyb: could not persist user vocabulary: {e}");
+            }
+        }
+    }
+}
+
 /// Wraps any base [`LanguageModel`] and folds a persistent [`UserModel`] into
 /// its predictions. The base model's session/reset behavior is untouched:
 /// `learn`/`unlearn` forward through unchanged, and only `note_commit`/
@@ -389,6 +521,9 @@ pub struct Personalized {
     user: UserModel,
     lambda_user: f64,
     path: PathBuf,
+    /// Writer thread (SPEC §10: file I/O must stay off the frame loop). `None`
+    /// only if the thread could not be spawned; saves then run inline.
+    saver: Option<SaveWorker>,
     commits_since_save: u32,
     dirty: bool,
 }
@@ -403,6 +538,7 @@ impl Personalized {
             inner,
             user,
             lambda_user: DEFAULT_LAMBDA_USER,
+            saver: SaveWorker::spawn(path.clone()),
             path,
             commits_since_save: 0,
             dirty: false,
@@ -434,9 +570,21 @@ impl Personalized {
         p
     }
 
+    /// Sweep, snapshot, and queue the snapshot for the writer thread. Every
+    /// step here is in-memory: sweeping ~20k contexts costs ~0.2 ms and
+    /// serializing them ~0.3 ms, both comfortably inside a frame.
     fn save_now(&mut self) {
-        if let Err(e) = self.user.save(&self.path) {
-            eprintln!("keyb: could not persist user vocabulary: {e}");
+        // Sweep before serializing so stale contexts leave the file.
+        self.user.sweep(now_secs());
+        let bytes = self.user.to_bytes();
+        match &self.saver {
+            Some(saver) => saver.submit(bytes),
+            // No writer thread: better a rare stall than lost personalization.
+            None => {
+                if let Err(e) = write_atomically(&self.path, &bytes) {
+                    eprintln!("keyb: could not persist user vocabulary: {e}");
+                }
+            }
         }
         self.commits_since_save = 0;
         self.dirty = false;
@@ -463,9 +611,6 @@ impl LanguageModel for Personalized {
         self.dirty = true;
         self.commits_since_save += 1;
         if self.commits_since_save >= SAVE_EVERY_COMMITS {
-            // Sweep before persisting so stale contexts leave the file.
-            let now = now_secs();
-            self.user.sweep(now);
             self.save_now();
         }
     }
@@ -502,10 +647,11 @@ impl LanguageModel for Personalized {
 }
 
 impl Drop for Personalized {
+    /// Queue a final snapshot. Dropping `saver` afterwards (fields drop after
+    /// this body) drains the mailbox and joins the writer, so the last
+    /// characters of a session are durable before the process exits.
     fn drop(&mut self) {
         if self.dirty {
-            let now = now_secs();
-            self.user.sweep(now);
             self.save_now();
         }
     }
@@ -586,6 +732,93 @@ mod tests {
             assert_eq!(a.0, b.0, "distributions must match after round trip");
             assert!((a.1 - b.1).abs() < 1e-9);
         }
+    }
+
+    /// Unique scratch path per test; no dev-dependency needed.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keyb-user-{}-{}-{name}",
+            std::process::id(),
+            now_secs()
+        ));
+        dir.join("user_model.v1.bin")
+    }
+
+    fn personalized(path: &Path) -> Personalized {
+        Personalized::load_or_new(N, Box::new(crate::PpmModel::new(N, 4)), path.to_path_buf())
+    }
+
+    /// `note_commit` runs on the render thread inside `Engine::step`, so the
+    /// periodic save must not block on it. Before this was fixed the
+    /// save-boundary commit measured ~72 ms on btrfs; the budget it has to fit
+    /// inside is one 8 ms frame (SPEC §10).
+    ///
+    /// Note the bound only bites on a filesystem where a synchronous save would
+    /// actually be slow. `temp_dir()` is tmpfs on some machines, where even the
+    /// old blocking path fit in a frame and nothing here would fail — this
+    /// guards the budget, it does not prove the write is asynchronous.
+    #[test]
+    fn periodic_save_never_blocks_the_commit_path() {
+        let path = scratch("latency");
+        let mut p = personalized(&path);
+        let mut ctx: Vec<u8> = Vec::new();
+        let mut worst = 0.0f64;
+        // Several save boundaries, so the timed window definitely contains one.
+        for i in 0..(SAVE_EVERY_COMMITS * 4) {
+            let sym = (i % N as u32) as u8;
+            let t = std::time::Instant::now();
+            p.note_commit(&ctx, sym);
+            worst = worst.max(t.elapsed().as_secs_f64() * 1e3);
+            ctx.push(sym);
+        }
+        drop(p);
+        assert!(
+            worst < 8.0,
+            "slowest note_commit was {worst:.2} ms; must stay inside a frame"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Moving the write off-thread must not lose it: dropping drains the
+    /// mailbox and joins, so the file is complete by the time drop returns.
+    #[test]
+    fn drop_flushes_the_final_snapshot() {
+        let path = scratch("flush");
+        let mut p = personalized(&path);
+        for _ in 0..3 {
+            p.note_commit(b"ab", 7);
+        }
+        assert!(!path.exists(), "no save is due before the debounce or drop");
+        drop(p);
+
+        let back = UserModel::load(&path, N, now_secs()).expect("final save must be on disk");
+        let (_, w) = back.predict(b"ab", now_secs());
+        assert!(w > 0.0, "the last commits must have survived the process");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The mailbox is latest-wins, so a burst of saves converges on the newest
+    /// state rather than replaying every intermediate snapshot.
+    #[test]
+    fn rapid_saves_persist_the_newest_state() {
+        let path = scratch("latest");
+        let mut p = personalized(&path);
+        let mut ctx: Vec<u8> = Vec::new();
+        for i in 0..(SAVE_EVERY_COMMITS * 5) {
+            let sym = (i % 3) as u8;
+            p.note_commit(&ctx, sym);
+            ctx.push(sym);
+        }
+        // One more commit after the last boundary, so only the drop-time
+        // snapshot contains it.
+        p.note_commit(b"zz", 11);
+        drop(p);
+
+        let back = UserModel::load(&path, N, now_secs()).expect("model on disk");
+        let (dist, w) = back.predict(b"zz", now_secs());
+        assert!(w > 0.0, "the newest snapshot must be the one that landed");
+        assert!(dist[11] > 1.0 / N as f64);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
