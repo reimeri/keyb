@@ -28,6 +28,11 @@ the built-in PPM character model and still works.
 
 Steering:
 
+- On **Niri**, the keyboard follows the keyboard-focused application to its
+  monitor when `NIRI_SOCKET` is available. Moving focus to an app on another
+  output moves the keyboard there without resetting the current text or zoom
+  state. If Niri IPC is temporarily unavailable, the keyboard stays on its
+  last output while the connection retries in the background.
 - **Hold the left button** to engage; release to stop.
 - **Right of centre = write, left = back.** Backward zoom is the only undo, and
   zooming back across a commit boundary retracts already-injected text.

@@ -552,8 +552,14 @@ Transient surface failures are classified explicitly: `Timeout` retries,
   *never* steal keyboard focus. winit has no layer-shell, so this frontend
   speaks smithay-client-toolkit directly and bridges the raw `wl_surface` into
   wgpu. `KEYB_SHELL` overrides the frontend; `KEYB_WIDTH` (logical px) overrides
-  the column width (default: 1/3 of the output). If the layer shell fails at
-  startup, the frontend falls back to a plain window with a message.
+  the column width (default: 1/3 of the output). On Niri, when `NIRI_SOCKET` is
+  available, an IPC event stream resolves the keyboard-focused window through
+  its workspace to an output; focus on another output recreates the layer
+  surface there while preserving engine and text state. IPC loss retains the
+  last output and reconnects in the background. Other Wayland compositors
+  retain the startup output.
+  If the layer shell fails at startup, the frontend falls back to a plain
+  window with a message.
 - X11: winit window with override-redirect + `_NET_WM_WINDOW_TYPE_DOCK`
   (unmanaged ⇒ the WM never focuses it), same right-edge full-height column.
 - `KEYB_SHELL=window` gives an ordinary resizable window — the convenient mode

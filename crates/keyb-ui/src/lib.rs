@@ -12,6 +12,7 @@
 
 mod font;
 mod layer_shell;
+mod niri_focus;
 mod scene;
 mod winit_shell;
 
@@ -156,7 +157,9 @@ impl Core {
 /// One vello render context + per-device renderers, shared by frontends.
 pub(crate) struct Gpu {
     pub context: RenderContext,
-    renderers: Vec<Option<Renderer>>,
+    /// Renderer pipelines are surface-format-specific. A migrated layer may
+    /// keep the same device while selecting a different format.
+    renderers: Vec<Option<(vello::wgpu::TextureFormat, Renderer)>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,7 +200,10 @@ impl Gpu {
     ) -> Result<()> {
         self.renderers
             .resize_with(self.context.devices.len().max(dev_id + 1), || None);
-        if self.renderers[dev_id].is_none() {
+        let format_changed = self.renderers[dev_id]
+            .as_ref()
+            .is_some_and(|(configured_format, _)| *configured_format != format);
+        if self.renderers[dev_id].is_none() || format_changed {
             let renderer = Renderer::new(
                 &self.context.devices[dev_id].device,
                 RendererOptions {
@@ -208,7 +214,7 @@ impl Gpu {
                 },
             )
             .context("create vello renderer")?;
-            self.renderers[dev_id] = Some(renderer);
+            self.renderers[dev_id] = Some((format, renderer));
         }
         Ok(())
     }
@@ -240,6 +246,7 @@ impl Gpu {
         self.renderers
             .get_mut(surface.dev_id)
             .and_then(Option::as_mut)
+            .map(|(_, renderer)| renderer)
             .context("renderer was not initialized for the surface device")?
             .render_to_surface(
                 &device_handle.device,

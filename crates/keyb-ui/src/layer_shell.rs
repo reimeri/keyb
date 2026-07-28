@@ -9,6 +9,7 @@
 //! wl_surface handle. Redraw is driven by frame callbacks (vsync-paced).
 
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
 use smithay_client_toolkit::{
@@ -16,6 +17,10 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{channel, EventLoop},
+        calloop_wayland_source::WaylandSource,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -45,6 +50,8 @@ use crate::{osk_width, Core, Gpu, RenderOutcome, HANDLE_H, HANDLE_W};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
 const BTN_LEFT: u32 = 0x110;
+const FOCUS_RETRY_MIN: Duration = Duration::from_secs(1);
+const FOCUS_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Raw-handle bridge from the layer surface to wgpu. Owning clones of the
 /// connection and surface proxies keeps both alive as long as the wgpu
@@ -84,17 +91,40 @@ impl raw_window_handle::HasWindowHandle for WaylandHandles {
     }
 }
 
+struct FocusRetry {
+    output: String,
+    attempt_at: Instant,
+    next_delay: Duration,
+}
+
+struct PendingLayer {
+    // Drop the native surface before its layer-owned wl_surface.
+    render_surface: RenderSurface<'static>,
+    layer: LayerSurface,
+    output: wl_output::WlOutput,
+    output_height: u32,
+    full_width: u32,
+    scale: i32,
+    name: String,
+}
+
 struct AppState {
+    // Declaration order is drop order: wgpu must release its native surface
+    // before the layer role destroys the underlying wl_surface.
+    render_surface: Option<RenderSurface<'static>>,
+    layer: LayerSurface,
+    pending_layer: Option<PendingLayer>,
     core: Core,
     gpu: Gpu,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
     shm: Shm,
+    conn: Connection,
+    qh: QueueHandle<Self>,
     compositor: CompositorState,
-    layer: LayerSurface,
+    layer_shell: LayerShell,
     pointer: Option<ThemedPointer>,
-    render_surface: Option<RenderSurface<'static>>,
     /// Logical size from the last configure.
     width: u32,
     height: u32,
@@ -102,6 +132,17 @@ struct AppState {
     /// the small handle size instead).
     full_width: u32,
     scale: i32,
+    /// Output currently hosting the layer surface. It is learned from
+    /// `surface_enter` for the compositor-selected initial placement.
+    current_output: Option<wl_output::WlOutput>,
+    /// Niri connector name most recently resolved from the focused app.
+    desired_output: Option<String>,
+    /// Newest queued focus change. Applying it after each calloop dispatch
+    /// coalesces rapid focus changes into one surface migration.
+    pending_output: Option<String>,
+    /// Failed migrations retry with capped exponential backoff so a transient
+    /// surface error cannot strand the keyboard on the old output.
+    focus_retry: Option<FocusRetry>,
     configured: bool,
     exit: bool,
     render_error: Option<anyhow::Error>,
@@ -123,37 +164,202 @@ impl AppState {
         self.layer.wl_surface().set_buffer_scale(self.scale);
     }
 
-    /// Size the column to ~1/3 of the output width (unless `KEYB_WIDTH` pins
-    /// it) once the compositor tells us the output's logical size. Re-commits
-    /// the layer surface if the width changed; the following `configure` then
-    /// carries the new size and calls `resize`.
-    fn apply_output_width(&mut self, output: &wl_output::WlOutput) {
-        if std::env::var_os("KEYB_WIDTH").is_some() {
-            return; // explicit override; ignore output size
-        }
-        let Some(info) = self.output_state.info(output) else {
-            return;
-        };
-        let ow = info
-            .logical_size
-            .map(|(w, _)| w)
+    fn output_named(&self, name: &str) -> Option<wl_output::WlOutput> {
+        self.output_state.outputs().find(|output| {
+            self.output_state
+                .info(output)
+                .and_then(|info| info.name)
+                .as_deref()
+                == Some(name)
+        })
+    }
+
+    fn output_size(&self, output: &wl_output::WlOutput) -> Option<(u32, u32)> {
+        let info = self.output_state.info(output)?;
+        info.logical_size
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .map(|(width, height)| (width as u32, height as u32))
             .or_else(|| {
+                let scale = info.scale_factor.max(1) as u32;
                 info.modes
                     .iter()
-                    .find(|m| m.current)
-                    .map(|m| m.dimensions.0)
+                    .find(|mode| mode.current)
+                    .and_then(|mode| {
+                        let (width, height) = mode.dimensions;
+                        (width > 0 && height > 0)
+                            .then_some((width as u32 / scale, height as u32 / scale))
+                    })
             })
-            .filter(|w| *w > 0);
-        let Some(ow) = ow else {
+    }
+
+    fn output_width(&self, output: &wl_output::WlOutput) -> Option<u32> {
+        self.output_size(output).map(|(width, _)| width)
+    }
+
+    /// Size the column to ~1/3 of its current output (unless `KEYB_WIDTH`
+    /// pins it). Ignore updates for other monitors.
+    fn apply_output_width(&mut self, output: &wl_output::WlOutput) {
+        if self.current_output.as_ref() != Some(output) || std::env::var_os("KEYB_WIDTH").is_some()
+        {
+            return;
+        }
+        let Some(output_width) = self.output_width(output) else {
             return;
         };
-        let want = osk_width(Some(ow as u32));
+        let want = osk_width(Some(output_width));
         self.full_width = want;
         // While hidden, only record the new width; it applies on the next show.
         if self.core.visible && want != self.width {
             self.width = want;
             self.layer.set_size(want, 0);
             self.layer.commit();
+        }
+    }
+
+    /// Move the layer surface to Niri's focused application's output. Layer
+    /// shell assigns an output only when a role is created, so migration means
+    /// replacing the wl_surface and its wgpu surface while retaining `Core`.
+    fn follow_focused_output(&mut self, name: String) -> Result<()> {
+        self.desired_output = Some(name.clone());
+        let Some(output) = self.output_named(&name) else {
+            // Output metadata may still be arriving; OutputHandler retries.
+            return Ok(());
+        };
+        if self.current_output.as_ref() == Some(&output)
+            || self
+                .pending_layer
+                .as_ref()
+                .is_some_and(|pending| pending.output == output)
+        {
+            return Ok(());
+        }
+
+        let info = self.output_state.info(&output);
+        let full_width = osk_width(self.output_width(&output));
+        let output_height = self
+            .output_size(&output)
+            .map(|(_, height)| height)
+            .unwrap_or(self.height.max(1));
+        let scale = info
+            .as_ref()
+            .map(|info| info.scale_factor.max(1))
+            .unwrap_or(1);
+        let (width, height) = if self.core.visible {
+            (full_width, output_height)
+        } else {
+            (HANDLE_W, HANDLE_H)
+        };
+
+        let surface = self.compositor.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Overlay,
+            Some("keyb"),
+            Some(&output),
+        );
+        if self.core.visible {
+            layer.set_anchor(Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
+            layer.set_size(full_width, 0);
+        } else {
+            layer.set_anchor(Anchor::RIGHT);
+            layer.set_size(HANDLE_W, HANDLE_H);
+        }
+        layer.set_exclusive_zone(0);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.wl_surface().set_buffer_scale(scale);
+        layer.commit();
+
+        let handles = WaylandHandles {
+            conn: self.conn.clone(),
+            surface: layer.wl_surface().clone(),
+        };
+        let render_surface = pollster::block_on(self.gpu.context.create_surface(
+            handles,
+            (width * scale as u32).max(1),
+            (height * scale as u32).max(1),
+            vello::wgpu::PresentMode::AutoVsync,
+        ))
+        .context("create render surface on focused output")?;
+        self.gpu
+            .ensure_renderer(render_surface.dev_id, render_surface.format)
+            .context("initialize renderer on focused output")?;
+
+        // Keep the current, valid layer mapped until the compositor accepts
+        // and configures the replacement. Replacing an older pending move is
+        // safe because PendingLayer drops its native surface before its role.
+        self.pending_layer = Some(PendingLayer {
+            render_surface,
+            layer,
+            output,
+            output_height,
+            full_width,
+            scale,
+            name,
+        });
+        Ok(())
+    }
+
+    fn schedule_focus_retry(&mut self, output: String, delay: Duration) {
+        self.focus_retry = Some(FocusRetry {
+            output,
+            attempt_at: Instant::now() + delay,
+            next_delay: (delay * 2).min(FOCUS_RETRY_MAX),
+        });
+    }
+
+    fn finish_pending_layer(&mut self, configure: LayerSurfaceConfigure, qh: &QueueHandle<Self>) {
+        let Some(pending) = self.pending_layer.take() else {
+            return;
+        };
+        let PendingLayer {
+            render_surface,
+            layer,
+            output,
+            output_height,
+            full_width,
+            scale,
+            name,
+        } = pending;
+        let fallback = if self.core.visible {
+            (full_width, output_height)
+        } else {
+            (HANDLE_W, HANDLE_H)
+        };
+        let (width, height) = configure.new_size;
+
+        // The replacement has now been accepted by the compositor. Retire the
+        // old native surface before destroying its layer-owned wl_surface.
+        let old_render_surface = self.render_surface.replace(render_surface);
+        let old_layer = std::mem::replace(&mut self.layer, layer);
+        self.core.engaged = false;
+        self.width = if width == 0 { fallback.0 } else { width };
+        self.height = if height == 0 { fallback.1 } else { height };
+        self.full_width = full_width;
+        self.scale = scale;
+        self.current_output = Some(output);
+        self.configured = true;
+        self.focus_retry = None;
+        self.resize();
+        drop(old_render_surface);
+        drop(old_layer);
+        eprintln!("keyb: moved keyboard to focused output {name}");
+        self.draw(qh);
+    }
+
+    fn reconsider_output(&mut self, output: &wl_output::WlOutput) {
+        let output_name = self.output_state.info(output).and_then(|info| info.name);
+        if output_name.as_deref() == self.desired_output.as_deref()
+            && self.current_output.as_ref() != Some(output)
+        {
+            if let Some(name) = output_name {
+                if let Err(error) = self.follow_focused_output(name.clone()) {
+                    eprintln!("keyb: could not move keyboard to focused output: {error:#}");
+                    self.schedule_focus_retry(name, FOCUS_RETRY_MIN);
+                }
+            }
+        } else {
+            self.apply_output_width(output);
         }
     }
 
@@ -221,11 +427,13 @@ impl CompositorHandler for AppState {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        self.scale = new_factor.max(1);
-        self.resize();
+        if surface == self.layer.wl_surface() {
+            self.scale = new_factor.max(1);
+            self.resize();
+        }
     }
 
     fn transform_changed(
@@ -237,17 +445,32 @@ impl CompositorHandler for AppState {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        self.draw(qh);
+    fn frame(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if surface == self.layer.wl_surface() {
+            self.draw(qh);
+        }
     }
 
     fn surface_enter(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        surface: &wl_surface::WlSurface,
+        output: &wl_output::WlOutput,
     ) {
+        if surface != self.layer.wl_surface() {
+            return;
+        }
+        if self.current_output.is_none() {
+            self.current_output = Some(output.clone());
+        }
+        self.apply_output_width(output);
     }
 
     fn surface_leave(
@@ -266,7 +489,7 @@ impl OutputHandler for AppState {
     }
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.apply_output_width(&output);
+        self.reconsider_output(&output);
     }
 
     fn update_output(
@@ -275,25 +498,63 @@ impl OutputHandler for AppState {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.apply_output_width(&output);
+        self.reconsider_output(&output);
     }
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if self.current_output.as_ref() == Some(&output) {
+            self.current_output = None;
+        }
+    }
 }
 
 impl LayerShellHandler for AppState {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self
+            .pending_layer
+            .as_ref()
+            .is_some_and(|pending| &pending.layer == layer)
+        {
+            let pending = self
+                .pending_layer
+                .take()
+                .expect("pending layer disappeared");
+            eprintln!(
+                "keyb: compositor rejected move to focused output {}; retrying",
+                pending.name
+            );
+            self.schedule_focus_retry(pending.name.clone(), FOCUS_RETRY_MIN);
+            return;
+        }
+        if layer == &self.layer {
+            self.exit = true;
+        }
     }
 
     fn configure(
         &mut self,
         _: &Connection,
         qh: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        if self
+            .pending_layer
+            .as_ref()
+            .is_some_and(|pending| &pending.layer == layer)
+        {
+            self.finish_pending_layer(configure, qh);
+            return;
+        }
+        if layer != &self.layer {
+            return;
+        }
         let (w, h) = configure.new_size;
         // Column: width from us, full height from the compositor. Keep the
         // last-known value on a 0 (which shouldn't happen under TOP|BOTTOM).
@@ -437,25 +698,92 @@ delegate_registry!(AppState);
 pub type LayerError = Box<(Core, anyhow::Error)>;
 
 /// Run as a layer-shell overlay. Redraw is frame-callback driven while the OSK
-/// is shown; when hidden it draws the static handle once and the loop idles
-/// until the next pointer event (a tap on the handle brings it back).
+/// is shown. A calloop source also wakes the loop for Niri focus changes, even
+/// while the collapsed handle is otherwise idle.
 pub fn run(core: Core) -> Result<(), LayerError> {
-    match setup(core) {
-        Ok((mut state, mut queue)) => loop {
-            if let Err(e) = queue.blocking_dispatch(&mut state) {
-                return Err(Box::new((
-                    state.core,
-                    anyhow!(e).context("wayland dispatch"),
-                )));
+    let (mut state, queue) = setup(core)?;
+    let mut event_loop = match EventLoop::<AppState>::try_new() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            return Err(Box::new((
+                state.core,
+                anyhow!(error).context("create layer-shell event loop"),
+            )))
+        }
+    };
+    // Do one dispatch pass per readiness notification. WaylandSource's
+    // convenience `insert` drains until no event remains; continuous frame
+    // callbacks can then starve the Niri channel on fast compositors.
+    if let Err(error) = event_loop.handle().insert_source(
+        WaylandSource::new(state.conn.clone(), queue),
+        |_, queue, state: &mut AppState| queue.dispatch_pending(state).map(|_| 0),
+    ) {
+        return Err(Box::new((
+            state.core,
+            anyhow!(error.error).context("register Wayland event source"),
+        )));
+    }
+    if let Some(focus_events) = crate::niri_focus::subscribe() {
+        if let Err(error) =
+            event_loop
+                .handle()
+                .insert_source(focus_events, |event, _, state: &mut AppState| {
+                    if let channel::Event::Msg(output) = event {
+                        state.pending_output = Some(output);
+                        state.focus_retry = None;
+                    }
+                })
+        {
+            return Err(Box::new((
+                state.core,
+                anyhow!(error.error).context("register Niri focus event source"),
+            )));
+        }
+    }
+
+    loop {
+        let timeout = state
+            .focus_retry
+            .as_ref()
+            .map(|retry| retry.attempt_at.saturating_duration_since(Instant::now()));
+        if let Err(error) = event_loop.dispatch(timeout, &mut state) {
+            return Err(Box::new((
+                state.core,
+                anyhow!(error).context("layer-shell event dispatch"),
+            )));
+        }
+        if let Some(error) = state.render_error.take() {
+            return Err(Box::new((state.core, error)));
+        }
+        let migration = state
+            .pending_output
+            .take()
+            .map(|output| (output, FOCUS_RETRY_MIN))
+            .or_else(|| {
+                let retry = state.focus_retry.take()?;
+                if retry.attempt_at > Instant::now() {
+                    state.focus_retry = Some(retry);
+                    return None;
+                }
+                Some((retry.output, retry.next_delay))
+            });
+        if let Some((output, retry_delay)) = migration {
+            let retry_output = output.clone();
+            if let Err(error) = state.follow_focused_output(output) {
+                // The old layer and render surfaces remain valid until a
+                // replacement is fully initialized. Keep the non-focusable
+                // OSK and retry with bounded backoff.
+                eprintln!("keyb: could not move keyboard to focused output: {error:#}");
+                state.focus_retry = Some(FocusRetry {
+                    output: retry_output,
+                    attempt_at: Instant::now() + retry_delay,
+                    next_delay: (retry_delay * 2).min(FOCUS_RETRY_MAX),
+                });
             }
-            if let Some(error) = state.render_error.take() {
-                return Err(Box::new((state.core, error)));
-            }
-            if state.exit {
-                return Ok(());
-            }
-        },
-        Err(e) => Err(e),
+        }
+        if state.exit {
+            return Ok(());
+        }
     }
 }
 
@@ -470,6 +798,7 @@ struct Parts {
     output_state: OutputState,
     shm: Shm,
     compositor: CompositorState,
+    layer_shell: LayerShell,
     layer: LayerSurface,
 }
 
@@ -503,6 +832,7 @@ fn wayland_parts() -> Result<Parts> {
         queue,
         shm,
         compositor,
+        layer_shell,
         layer,
     })
 }
@@ -512,6 +842,7 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
         Ok(p) => p,
         Err(e) => return Err(Box::new((core, e))),
     };
+    let qh = parts.queue.handle();
     let mut gpu = Gpu::new();
     let handles = WaylandHandles {
         conn: parts.conn.clone(),
@@ -543,14 +874,22 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
             seat_state: parts.seat_state,
             output_state: parts.output_state,
             shm: parts.shm,
+            conn: parts.conn,
+            qh,
             compositor: parts.compositor,
+            layer_shell: parts.layer_shell,
             layer: parts.layer,
+            pending_layer: None,
             pointer: None,
             render_surface: Some(render_surface),
             width: w,
             height: h,
             full_width: w,
             scale: 1,
+            current_output: None,
+            desired_output: None,
+            pending_output: None,
+            focus_retry: None,
             configured: false,
             exit: false,
             render_error: None,
