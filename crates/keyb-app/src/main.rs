@@ -66,10 +66,14 @@ fn language_model(alphabet: &Alphabet) -> Box<dyn LanguageModel> {
 /// capabilities (read once at startup for the hysteresis decision).
 fn injection_worker(
     mut injector: Box<dyn Injector>,
-) -> (crossbeam_channel::Sender<TextEvent>, keyb_inject::Caps) {
+) -> (
+    crossbeam_channel::Sender<TextEvent>,
+    keyb_inject::Caps,
+    std::thread::JoinHandle<()>,
+) {
     let caps = injector.capabilities();
     let (tx, rx) = crossbeam_channel::unbounded::<TextEvent>();
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("keyb-inject".into())
         .spawn(move || {
             let mut ledger = RetractionLedger::default();
@@ -95,7 +99,7 @@ fn injection_worker(
             }
         })
         .expect("spawn injection worker");
-    (tx, caps)
+    (tx, caps, worker)
 }
 
 fn main() -> Result<()> {
@@ -118,7 +122,7 @@ fn main() -> Result<()> {
     let chars: Vec<char> = (0..alphabet.len() as u8)
         .map(|s| alphabet.char_of(s))
         .collect();
-    let (tx, caps) = injection_worker(keyb_inject::detect(&chars));
+    let (tx, caps, injection_thread) = injection_worker(keyb_inject::detect(&chars));
     eprintln!(
         "keyb: injecting via {} ({} retraction)",
         caps.name,
@@ -143,12 +147,18 @@ fn main() -> Result<()> {
     }
 
     let engine = Engine::new(alphabet, lm, params);
-    keyb_ui::run(
+    let ui_result = keyb_ui::run(
         engine,
         Box::new(move |ev| {
             let _ = tx.send(ev);
         }),
-    )
+    );
+    // UI teardown drops the final sender. Drain any text already queued before
+    // allowing process exit so Close is a clean shutdown of the injector too.
+    injection_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("injection worker panicked during shutdown"))?;
+    ui_result
 }
 
 #[cfg(test)]

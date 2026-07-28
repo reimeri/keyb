@@ -17,11 +17,17 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::{osk_width, Core, Gpu};
+use crate::scene::{ribbon_control_at, RibbonControl, MIN_CANVAS_W};
+use crate::{osk_width, Core, Gpu, RIBBON_H};
 
 struct RenderState {
     surface: vello::util::RenderSurface<'static>,
     window: Arc<Window>,
+}
+
+fn clamp_osk_width(width: u32, monitor_width: u32, scale: f64) -> u32 {
+    let min_width = ((MIN_CANVAS_W * scale).ceil() as u32).min(monitor_width);
+    width.clamp(min_width, monitor_width)
 }
 
 struct App {
@@ -82,29 +88,37 @@ impl App {
         event_loop.exit();
     }
 
-    /// Left-button press: toggle visibility via the hide button / edge handle,
-    /// otherwise engage steering (mirrors the layer-shell frontend).
-    fn press(&mut self) {
+    /// Left-button press: activate a ribbon control / edge handle, otherwise
+    /// engage steering (mirrors the layer-shell frontend).
+    fn press(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = &self.state else { return };
         let scale = state.window.scale_factor();
         let lw = state.window.inner_size().width as f64 / scale;
         let (cx, cy) = self.core.cursor;
         if !self.core.visible {
             self.core.visible = true;
-        } else if crate::scene::hide_button_rect(lw).contains(vello::kurbo::Point::new(cx, cy)) {
-            self.core.visible = false;
-            self.core.engaged = false;
-        } else if crate::scene::reset_button_rect(lw).contains(vello::kurbo::Point::new(cx, cy)) {
-            self.core.reset();
         } else {
-            self.core.engaged = true;
+            match ribbon_control_at(lw, vello::kurbo::Point::new(cx, cy)) {
+                Some(RibbonControl::Collapse) => {
+                    self.core.visible = false;
+                    self.core.engaged = false;
+                }
+                Some(RibbonControl::Reset) => self.core.reset(),
+                Some(RibbonControl::Close) => {
+                    self.core.engaged = false;
+                    event_loop.exit();
+                }
+                None => self.core.engaged = true,
+            }
         }
     }
 
     fn window_attributes(&self, event_loop: &ActiveEventLoop) -> winit::window::WindowAttributes {
         let attrs = Window::default_attributes().with_title("keyb");
         if !self.osk {
-            return attrs.with_inner_size(LogicalSize::new(1200.0, 800.0));
+            return attrs
+                .with_inner_size(LogicalSize::new(1200.0, 800.0))
+                .with_min_inner_size(LogicalSize::new(MIN_CANVAS_W, RIBBON_H));
         }
         // Full-height column on the right edge of the primary monitor.
         let monitor = event_loop
@@ -125,7 +139,9 @@ impl App {
             .and_then(|s| s.parse::<f64>().ok())
             .map(|lw| (lw * mscale) as u32)
             .unwrap_or_else(|| osk_width(Some(msize.width)));
-        let w = w.clamp(1, msize.width);
+        // Keep all three ribbon controls independently clickable even when a
+        // smaller KEYB_WIDTH was requested.
+        let w = clamp_osk_width(w, msize.width, mscale);
         let attrs = attrs
             .with_inner_size(PhysicalSize::new(w, msize.height))
             .with_position(PhysicalPosition::new(
@@ -181,7 +197,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
                     if state == ElementState::Pressed {
-                        self.press();
+                        self.press(event_loop);
                     } else {
                         self.core.engaged = false;
                     }
@@ -256,5 +272,17 @@ pub fn run(core: Core, osk: bool) -> Result<()> {
     match app.error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_osk_width;
+
+    #[test]
+    fn osk_width_preserves_distinct_toolbar_controls() {
+        assert_eq!(clamp_osk_width(100, 1920, 1.0), 120);
+        assert_eq!(clamp_osk_width(100, 3840, 2.0), 240);
+        assert_eq!(clamp_osk_width(100, 80, 1.0), 80);
     }
 }

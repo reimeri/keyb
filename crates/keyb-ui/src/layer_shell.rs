@@ -45,7 +45,7 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-use crate::scene::{hide_button_rect, reset_button_rect};
+use crate::scene::{ribbon_control_at, RibbonControl};
 use crate::{osk_width, Core, Gpu, RenderOutcome, HANDLE_H, HANDLE_W};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
@@ -145,6 +145,10 @@ struct AppState {
     focus_retry: Option<FocusRetry>,
     configured: bool,
     exit: bool,
+    /// Set only by the on-canvas Close control, so an unrelated render error
+    /// delivered in the same dispatch cannot turn an intentional quit into a
+    /// fallback window.
+    close_requested: bool,
     render_error: Option<anyhow::Error>,
 }
 
@@ -642,16 +646,18 @@ impl PointerHandler for AppState {
                     if !self.core.visible {
                         // Any tap on the collapsed handle reopens the OSK.
                         self.set_visible(true);
-                    } else if hide_button_rect(self.width as f64)
-                        .contains(vello::kurbo::Point::new(cx, cy))
-                    {
-                        self.set_visible(false);
-                    } else if reset_button_rect(self.width as f64)
-                        .contains(vello::kurbo::Point::new(cx, cy))
-                    {
-                        self.core.reset();
                     } else {
-                        self.core.engaged = true;
+                        match ribbon_control_at(self.width as f64, vello::kurbo::Point::new(cx, cy))
+                        {
+                            Some(RibbonControl::Collapse) => self.set_visible(false),
+                            Some(RibbonControl::Reset) => self.core.reset(),
+                            Some(RibbonControl::Close) => {
+                                self.core.engaged = false;
+                                self.close_requested = true;
+                                self.exit = true;
+                            }
+                            None => self.core.engaged = true,
+                        }
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
@@ -752,8 +758,18 @@ pub fn run(core: Core) -> Result<(), LayerError> {
                 anyhow!(error).context("layer-shell event dispatch"),
             )));
         }
+        // An explicit UI close wins over other callbacks delivered in the same
+        // dispatch: it must not accidentally open the fallback window.
+        if state.close_requested {
+            return Ok(());
+        }
         if let Some(error) = state.render_error.take() {
             return Err(Box::new((state.core, error)));
+        }
+        // Other exit sources (such as the compositor closing the layer) also
+        // tear down before starting a queued output migration.
+        if state.exit {
+            return Ok(());
         }
         let migration = state
             .pending_output
@@ -780,9 +796,6 @@ pub fn run(core: Core) -> Result<(), LayerError> {
                     next_delay: (retry_delay * 2).min(FOCUS_RETRY_MAX),
                 });
             }
-        }
-        if state.exit {
-            return Ok(());
         }
     }
 }
@@ -892,6 +905,7 @@ fn setup(core: Core) -> Result<Setup, LayerError> {
             focus_retry: None,
             configured: false,
             exit: false,
+            close_requested: false,
             render_error: None,
         },
         parts.queue,

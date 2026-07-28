@@ -35,7 +35,7 @@ pub const ORIGIN_X_FRAC: f64 = 0.18;
 /// always full height.
 pub const OSK_W: u32 = 620;
 /// Size of the collapsed handle/tab (logical px) shown on the screen edge when
-/// the keyboard is hidden. Clicking it (or a SIGUSR1) brings the OSK back.
+/// the keyboard is collapsed. Clicking it brings the OSK back.
 pub const HANDLE_W: u32 = 28;
 pub const HANDLE_H: u32 = 110;
 
@@ -62,8 +62,8 @@ pub(crate) struct Core {
     ribbon: scene::RibbonCache,
     pub cursor: (f64, f64),
     pub engaged: bool,
-    /// Whether the OSK is shown. When false the engine is frozen and only the
-    /// collapsed handle is drawn (SPEC §7.3: dismissible overlay).
+    /// Whether the OSK is expanded. When false the engine is frozen and only
+    /// the collapsed handle is drawn (SPEC §7.3: dismissible overlay).
     pub visible: bool,
     pub sink: TextSink,
     last_frame: Instant,

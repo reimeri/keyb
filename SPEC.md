@@ -528,9 +528,9 @@ with a long-term record of what this user actually writes. Enabled by default;
 - Steering reference: a vertical origin line at 18 % of the canvas width, a
   crosshair tick at the vertical center, and — while engaged — a line from the
   crosshair to the cursor.
-- Two on-canvas controls in the ribbon's top-right corner: **×** collapses the
-  OSK to an edge handle (§7.3), **↺** resets the engine (§5.2). A speed readout
-  sits bottom-left.
+- Three on-canvas controls in the ribbon: **↺** resets the engine (§5.2) and
+  **›** collapses the OSK to an edge handle (§7.3) at top-left; **×** at
+  top-right quits keyb completely. A speed readout sits bottom-left.
 
 ### 7.2 Frame loop
 
@@ -564,8 +564,11 @@ Transient surface failures are classified explicitly: `Timeout` retries,
   (unmanaged ⇒ the WM never focuses it), same right-edge full-height column.
 - `KEYB_SHELL=window` gives an ordinary resizable window — the convenient mode
   for development.
-- **Dismissal**: the OSK collapses to a small edge handle (28 × 110 px), which
-  freezes the engine and draws only the handle; clicking the handle restores it.
+- **Dismissal**: the OSK can be collapsed to a small edge handle (28 × 110 px),
+  which freezes the engine and draws only the handle; clicking the handle
+  restores it. The separate **×** control exits the process, destroying the
+  native surface and all rendering resources; reopening requires launching
+  keyb again.
 - **Pointer capture is not implemented.** The design calls for pointer-lock while
   steering so the cursor can't wander off the OSK mid-word; both frontends
   instead disengage steering when the pointer leaves the column (fail-safe
@@ -748,8 +751,8 @@ Known gaps:
    layer-shell/override-redirect window behavior.
 4. **M4 — Polish.** 🚧 In progress.
    - done: adaptive speed control (opt-in via `KEYB_ADAPTIVE`), alphabet group
-     boxes, model auto-provisioning, persistent user vocabulary (§6.7), hide
-     handle and reset control.
+     boxes, model auto-provisioning, persistent user vocabulary (§6.7),
+     collapse handle, reset control, and UI close control.
    - open: **action nodes** (§5.4), **settings UI** (§7.4), **config file and
      data-driven alphabets** (§9), **novice onboarding overlay**, **pointer
      capture** (§7.3), **UI-surfaced privacy toggle** (§9), packaging

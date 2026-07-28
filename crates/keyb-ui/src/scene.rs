@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use keyb_core::{Engine, GroupColor, PointerInput};
-use vello::kurbo::{Affine, Line, Rect, RoundedRect, Stroke};
-use vello::peniko::{Color, Fill};
+use vello::kurbo::{Affine, Line, Point, Rect, RoundedRect, Stroke};
+use vello::peniko::{Color, Fill, Mix};
 use vello::{Glyph, Scene};
 
 use crate::font::FontAssets;
@@ -14,19 +14,57 @@ use crate::{ORIGIN_X_FRAC, RIBBON_H};
 
 /// Labels appear once a box is at least this tall (px).
 const LABEL_MIN_PX: f64 = 18.0;
+/// Left edge of ribbon text, after the reset and collapse controls.
+const RIBBON_TEXT_X: f64 = 94.0;
+/// Smallest canvas width at which the three ribbon controls remain separate.
+pub(crate) const MIN_CANVAS_W: f64 = 120.0;
 
-/// Hit-testable rectangle (logical px) of the `×` hide button, in the ribbon's
-/// top-right corner. Single source of truth for both drawing and click
-/// hit-testing across frontends.
-pub fn hide_button_rect(lw: f64) -> Rect {
+/// Hit-testable rectangle (logical px) of the reset button at the ribbon's
+/// top-left. Tapping it returns the engine to its start state (SPEC §7).
+pub fn reset_button_rect() -> Rect {
+    Rect::new(14.0, 12.0, 42.0, 40.0)
+}
+/// Hit-testable rectangle of the collapse button beside reset. Tapping it
+/// shrinks the keyboard to its edge handle.
+pub fn collapse_button_rect() -> Rect {
+    Rect::new(48.0, 12.0, 76.0, 40.0)
+}
+/// Hit-testable rectangle of the close button at the ribbon's top-right.
+/// Tapping it quits keyb completely.
+pub fn close_button_rect(lw: f64) -> Rect {
     Rect::new(lw - 42.0, 12.0, lw - 14.0, 40.0)
 }
-/// Hit-testable rectangle (logical px) of the reset button, one button-width to
-/// the left of the `×` hide button. Tapping it returns the engine to its start
-/// state (SPEC §7). Single source of truth for drawing and hit-testing.
-pub fn reset_button_rect(lw: f64) -> Rect {
-    Rect::new(lw - 76.0, 12.0, lw - 48.0, 40.0)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RibbonControl {
+    Reset,
+    Collapse,
+    Close,
 }
+
+/// Resolve a ribbon click once so both window frontends have identical control
+/// routing. The supported canvas width never allows these regions to overlap.
+pub(crate) fn ribbon_control_at(lw: f64, point: Point) -> Option<RibbonControl> {
+    if reset_button_rect().contains(point) {
+        Some(RibbonControl::Reset)
+    } else if collapse_button_rect().contains(point) {
+        Some(RibbonControl::Collapse)
+    } else if close_button_rect(lw).contains(point) {
+        Some(RibbonControl::Close)
+    } else {
+        None
+    }
+}
+
+fn ribbon_text_rect(lw: f64) -> Rect {
+    Rect::new(
+        RIBBON_TEXT_X,
+        0.0,
+        (close_button_rect(lw).x0 - 2.0).max(RIBBON_TEXT_X),
+        RIBBON_H,
+    )
+}
+
 /// Extra gap (px) reserved between a box's label glyph and its nearest child's
 /// left edge, so the glyph is never touched by the child's fill.
 const LABEL_PAD: f64 = 4.0;
@@ -253,7 +291,8 @@ pub fn build(
     // keeps steering here — shown dim past the caret so letters appear the
     // instant they are steered over, not only after the commit debounce.
     let pending: String = engine.pending_text().chars().take(24).collect();
-    let max_chars = ((lw - 60.0) / (font_px as f64 * 0.6)).max(4.0) as usize;
+    let text_clip = ribbon_text_rect(lw);
+    let max_chars = (text_clip.width() / (font_px as f64 * 0.6)).max(4.0) as usize;
     let budget = max_chars.saturating_sub(pending.chars().count()).max(4);
     let shown = engine.committed_tail_text(budget).replace(' ', "\u{2423}");
     if ribbon.committed != shown {
@@ -268,10 +307,13 @@ pub fn build(
     }
     let adv = ribbon.committed_advance;
     let baseline = RIBBON_H * 0.68;
+    // Character-count budgeting is intentionally approximate, so clip shaped
+    // text and its caret to guarantee they never paint under Close.
+    scene.push_layer(Mix::Clip, 1.0, t, &text_clip);
     scene
         .draw_glyphs(&fonts.font)
         .font_size(font_px)
-        .transform(t * Affine::translate((16.0, baseline)))
+        .transform(t * Affine::translate((RIBBON_TEXT_X, baseline)))
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, ribbon.committed_glyphs.iter().copied());
     scene.fill(
@@ -280,9 +322,9 @@ pub fn build(
         Color::from_rgb8(0x7A, 0xA2, 0xF7),
         None,
         &Rect::new(
-            16.0 + adv as f64 + 3.0,
+            RIBBON_TEXT_X + adv as f64 + 3.0,
             baseline - font_px as f64 * 0.75,
-            16.0 + adv as f64 + 6.0,
+            RIBBON_TEXT_X + adv as f64 + 6.0,
             baseline + font_px as f64 * 0.15,
         ),
     );
@@ -290,40 +332,16 @@ pub fn build(
         scene
             .draw_glyphs(&fonts.font)
             .font_size(font_px)
-            .transform(t * Affine::translate((16.0 + adv as f64 + 12.0, baseline)))
+            .transform(t * Affine::translate((RIBBON_TEXT_X + adv as f64 + 12.0, baseline)))
             .brush(Color::from_rgb8(0x6E, 0x76, 0x92))
             .draw(Fill::NonZero, ribbon.pending_glyphs.iter().copied());
     }
+    scene.pop_layer();
 
-    // Hide button: an `×` in the ribbon's top-right corner (drawn on top of the
-    // ribbon). Clicking it collapses the OSK to the edge handle.
-    let btn = hide_button_rect(lw);
-    scene.fill(
-        Fill::NonZero,
-        t,
-        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
-        None,
-        &RoundedRect::from_rect(btn, 6.0),
-    );
-    let x_px = (btn.height() * 0.72) as f32;
-    let (glyphs, adv) = fonts.layout("\u{00D7}", x_px);
-    scene
-        .draw_glyphs(&fonts.font)
-        .font_size(x_px)
-        .transform(
-            t * Affine::translate((
-                btn.center().x - adv as f64 / 2.0,
-                btn.center().y + x_px as f64 * 0.35,
-            )),
-        )
-        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
-        .draw(Fill::NonZero, glyphs.into_iter());
-
-    // Reset button: a `↺` just left of the hide button. Clicking it returns the
-    // engine to its start state (fresh tree, empty context) without touching
-    // text already typed into the target app. Falls back to `R` where the system
-    // font lacks the circular-arrow glyph.
-    let btn = reset_button_rect(lw);
+    // Reset button at top-left: return to a fresh tree and empty context
+    // without touching text already typed into the target app. Falls back to
+    // `R` where the system font lacks the circular-arrow glyph.
+    let btn = reset_button_rect();
     scene.fill(
         Fill::NonZero,
         t,
@@ -345,6 +363,59 @@ pub fn build(
             t * Affine::translate((
                 btn.center().x - adv as f64 / 2.0,
                 btn.center().y + r_px as f64 * 0.35,
+            )),
+        )
+        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
+        .draw(Fill::NonZero, glyphs.into_iter());
+
+    // Collapse button beside reset. Since the keyboard is attached to the
+    // right edge, the chevron points toward that edge and the collapsed tab.
+    let btn = collapse_button_rect();
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
+        None,
+        &RoundedRect::from_rect(btn, 6.0),
+    );
+    let collapse_px = (btn.height() * 0.72) as f32;
+    let collapse_label = if fonts.has_glyph('\u{203A}') {
+        "\u{203A}" // ›
+    } else {
+        ">"
+    };
+    let (glyphs, adv) = fonts.layout(collapse_label, collapse_px);
+    scene
+        .draw_glyphs(&fonts.font)
+        .font_size(collapse_px)
+        .transform(
+            t * Affine::translate((
+                btn.center().x - adv as f64 / 2.0,
+                btn.center().y + collapse_px as f64 * 0.35,
+            )),
+        )
+        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
+        .draw(Fill::NonZero, glyphs.into_iter());
+
+    // Close button at top-right. Unlike collapse, this exits keyb and removes
+    // its native surface completely.
+    let btn = close_button_rect(lw);
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
+        None,
+        &RoundedRect::from_rect(btn, 6.0),
+    );
+    let close_px = (btn.height() * 0.72) as f32;
+    let (glyphs, adv) = fonts.layout("\u{00D7}", close_px);
+    scene
+        .draw_glyphs(&fonts.font)
+        .font_size(close_px)
+        .transform(
+            t * Affine::translate((
+                btn.center().x - adv as f64 / 2.0,
+                btn.center().y + close_px as f64 * 0.35,
             )),
         )
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
@@ -465,18 +536,59 @@ fn hsl(h: f64, s: f64, l: f64) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{box_left_edges, hide_button_rect, LABEL_PAD};
+    use super::{
+        box_left_edges, close_button_rect, collapse_button_rect, reset_button_rect,
+        ribbon_control_at, ribbon_text_rect, RibbonControl, LABEL_PAD, MIN_CANVAS_W, RIBBON_TEXT_X,
+    };
     use crate::RIBBON_H;
+    use vello::kurbo::Point;
 
     const LW: f64 = 620.0;
 
-    /// The hide button sits fully inside the ribbon and against the right edge.
     #[test]
-    fn hide_button_in_ribbon() {
-        let r = hide_button_rect(LW);
-        assert!(r.x0 >= 0.0 && r.x1 <= LW, "within canvas width");
-        assert!(r.y0 >= 0.0 && r.y1 <= RIBBON_H, "within the ribbon");
-        assert!(r.x1 > LW * 0.8, "anchored to the right");
+    fn toolbar_buttons_are_aligned_and_separate() {
+        for lw in [LW, MIN_CANVAS_W] {
+            let reset = reset_button_rect();
+            let collapse = collapse_button_rect();
+            let close = close_button_rect(lw);
+            for button in [reset, collapse, close] {
+                assert!(button.x0 >= 0.0 && button.x1 <= lw, "within canvas width");
+                assert!(
+                    button.y0 >= 0.0 && button.y1 <= RIBBON_H,
+                    "within the ribbon"
+                );
+            }
+            assert!(reset.x1 < collapse.x0, "left controls do not overlap");
+            assert!(collapse.x1 < close.x0, "close is separate on the right");
+            assert!(reset.x0 < lw * 0.2, "reset is anchored to the left");
+            assert!(close.x1 > lw * 0.8, "close is anchored to the right");
+        }
+        assert!(
+            collapse_button_rect().x1 < RIBBON_TEXT_X,
+            "left controls do not overlap ribbon text"
+        );
+        assert!(
+            ribbon_text_rect(LW).x1 <= close_button_rect(LW).x0,
+            "ribbon text is clipped before close"
+        );
+    }
+
+    #[test]
+    fn ribbon_clicks_route_to_distinct_controls() {
+        for (button, expected) in [
+            (reset_button_rect(), RibbonControl::Reset),
+            (collapse_button_rect(), RibbonControl::Collapse),
+            (close_button_rect(MIN_CANVAS_W), RibbonControl::Close),
+        ] {
+            assert_eq!(
+                ribbon_control_at(MIN_CANVAS_W, button.center()),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            ribbon_control_at(MIN_CANVAS_W, Point::new(100.0, 50.0)),
+            None
+        );
     }
 
     /// Reserve reserved for a labeled box of height `h` with glyph advance `adv`.

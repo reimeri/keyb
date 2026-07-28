@@ -37,8 +37,9 @@ Steering:
 - **Right of centre = write, left = back.** Backward zoom is the only undo, and
   zooming back across a commit boundary retracts already-injected text.
 - **Vertical position** selects which box you drift toward.
-- Scroll wheel or `+`/`-` adjusts speed; `Esc` quits. The on-screen buttons hide
-  the keyboard and reset the current context.
+- Scroll wheel or `+`/`-` adjusts speed; `Esc` quits. In the ribbon, **↺** resets
+  the current context, **›** collapses to the edge handle, and **×** quits keyb
+  completely.
 
 Typed words are learned into a decaying personal vocabulary at
 `$XDG_DATA_HOME/keyb/user_model.v1.bin`.
