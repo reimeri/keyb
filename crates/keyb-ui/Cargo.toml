@@ -11,6 +11,7 @@ winit = "0.30"
 skrifa = "0.26"
 pollster = "0.4"
 anyhow = "1"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 serde_json = "1"
 # Layer-shell frontend (SPEC §7.3): winit has no layer-shell, so this
 # frontend talks to the compositor directly and bridges the raw wl_surface

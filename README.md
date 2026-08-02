@@ -21,7 +21,10 @@ injected into whatever application has focus (Wayland or X11).
 Environment-specific support:
 
 - **Wayland overlay:** requires the compositor to expose `wlr-layer-shell`;
-  otherwise keyb falls back to a regular window. Injection prefers
+  otherwise keyb falls back to a regular window. The Copy button additionally
+  needs `ext-data-control` or `wlr-data-control`; when neither is available it
+  falls back to X11 clipboard access if `DISPLAY` is set, or reports an error to
+  stderr. Injection prefers
   `input-method-v2` or `virtual-keyboard-v1`; if neither is available,
   auto-detection tries X11/XTEST when `DISPLAY` is set, then the non-injecting
   buffer. XTEST reaches only X11/Xwayland clients.
@@ -58,8 +61,8 @@ Steering:
   zooming back across a commit boundary retracts already-injected text.
 - **Vertical position** selects which box you drift toward.
 - Scroll wheel or `+`/`-` adjusts speed; `Esc` quits. In the ribbon, **↺** resets
-  the current context, **›** collapses to the edge handle, and **×** quits keyb
-  completely.
+  the current context, **›** collapses to the edge handle, **⎘** copies all
+  finalized text to the clipboard, and **×** quits keyb completely.
 
 Typed words are learned into a decaying personal vocabulary at
 `$XDG_DATA_HOME/keyb/user_model.v1.bin` (or

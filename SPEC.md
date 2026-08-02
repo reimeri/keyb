@@ -528,9 +528,13 @@ with a long-term record of what this user actually writes. Enabled by default;
 - Steering reference: a vertical origin line at 18 % of the canvas width, a
   crosshair tick at the vertical center, and — while engaged — a line from the
   crosshair to the cursor.
-- Three on-canvas controls in the ribbon: **↺** resets the engine (§5.2) and
-  **›** collapses the OSK to an edge handle (§7.3) at top-left; **×** at
-  top-right quits keyb completely. A speed readout sits bottom-left.
+- Four on-canvas controls in the ribbon: **↺** resets the engine (§5.2), **›**
+  collapses the OSK to an edge handle (§7.3), and **⎘** copies all finalized
+  committed text (excluding the dim pending preview) to the system clipboard
+  at top-left; **×** at top-right quits keyb completely. Native Wayland copy
+  uses `ext-data-control`/`wlr-data-control`, falling back to X11 clipboard
+  access when available and logging an error otherwise. A speed readout sits
+  bottom-left.
 
 ### 7.2 Frame loop
 
