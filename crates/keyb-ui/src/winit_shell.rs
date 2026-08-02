@@ -104,6 +104,12 @@ impl App {
                     self.core.engaged = false;
                 }
                 Some(RibbonControl::Reset) => self.core.reset(),
+                Some(RibbonControl::Copy) => {
+                    self.core.engaged = false;
+                    if let Err(error) = self.core.copy_committed_text() {
+                        eprintln!("keyb: could not copy text: {error:#}");
+                    }
+                }
                 Some(RibbonControl::Close) => {
                     self.core.engaged = false;
                     event_loop.exit();
@@ -139,7 +145,7 @@ impl App {
             .and_then(|s| s.parse::<f64>().ok())
             .map(|lw| (lw * mscale) as u32)
             .unwrap_or_else(|| osk_width(Some(msize.width)));
-        // Keep all three ribbon controls independently clickable even when a
+        // Keep all four ribbon controls independently clickable even when a
         // smaller KEYB_WIDTH was requested.
         let w = clamp_osk_width(w, msize.width, mscale);
         let attrs = attrs
@@ -281,8 +287,8 @@ mod tests {
 
     #[test]
     fn osk_width_preserves_distinct_toolbar_controls() {
-        assert_eq!(clamp_osk_width(100, 1920, 1.0), 120);
-        assert_eq!(clamp_osk_width(100, 3840, 2.0), 240);
+        assert_eq!(clamp_osk_width(100, 1920, 1.0), 154);
+        assert_eq!(clamp_osk_width(100, 3840, 2.0), 308);
         assert_eq!(clamp_osk_width(100, 80, 1.0), 80);
     }
 }

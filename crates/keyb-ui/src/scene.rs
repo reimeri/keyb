@@ -14,10 +14,10 @@ use crate::{ORIGIN_X_FRAC, RIBBON_H};
 
 /// Labels appear once a box is at least this tall (px).
 const LABEL_MIN_PX: f64 = 18.0;
-/// Left edge of ribbon text, after the reset and collapse controls.
-const RIBBON_TEXT_X: f64 = 94.0;
-/// Smallest canvas width at which the three ribbon controls remain separate.
-pub(crate) const MIN_CANVAS_W: f64 = 120.0;
+/// Left edge of ribbon text, after the reset, collapse, and copy controls.
+const RIBBON_TEXT_X: f64 = 128.0;
+/// Smallest canvas width at which the four ribbon controls remain separate.
+pub(crate) const MIN_CANVAS_W: f64 = 154.0;
 
 /// Hit-testable rectangle (logical px) of the reset button at the ribbon's
 /// top-left. Tapping it returns the engine to its start state (SPEC §7).
@@ -29,6 +29,11 @@ pub fn reset_button_rect() -> Rect {
 pub fn collapse_button_rect() -> Rect {
     Rect::new(48.0, 12.0, 76.0, 40.0)
 }
+/// Hit-testable rectangle of the copy button beside collapse. Tapping it puts
+/// all finalized text on the system clipboard.
+pub fn copy_button_rect() -> Rect {
+    Rect::new(82.0, 12.0, 110.0, 40.0)
+}
 /// Hit-testable rectangle of the close button at the ribbon's top-right.
 /// Tapping it quits keyb completely.
 pub fn close_button_rect(lw: f64) -> Rect {
@@ -39,6 +44,7 @@ pub fn close_button_rect(lw: f64) -> Rect {
 pub(crate) enum RibbonControl {
     Reset,
     Collapse,
+    Copy,
     Close,
 }
 
@@ -49,6 +55,8 @@ pub(crate) fn ribbon_control_at(lw: f64, point: Point) -> Option<RibbonControl> 
         Some(RibbonControl::Reset)
     } else if collapse_button_rect().contains(point) {
         Some(RibbonControl::Collapse)
+    } else if copy_button_rect().contains(point) {
+        Some(RibbonControl::Copy)
     } else if close_button_rect(lw).contains(point) {
         Some(RibbonControl::Close)
     } else {
@@ -397,6 +405,40 @@ pub fn build(
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
 
+    // Copy button beside collapse: two offset page outlines avoid relying on
+    // the system font having a recognizable clipboard glyph.
+    let btn = copy_button_rect();
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
+        None,
+        &RoundedRect::from_rect(btn, 6.0),
+    );
+    let back_page = RoundedRect::new(btn.x0 + 6.0, btn.y0 + 5.0, btn.x1 - 11.0, btn.y1 - 8.0, 2.0);
+    let front_page = RoundedRect::new(btn.x0 + 11.0, btn.y0 + 9.0, btn.x1 - 6.0, btn.y1 - 4.0, 2.0);
+    scene.stroke(
+        &Stroke::new(1.6),
+        t,
+        Color::from_rgba8(0xD8, 0xDC, 0xE8, 160),
+        None,
+        &back_page,
+    );
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgb8(0x28, 0x2B, 0x39),
+        None,
+        &front_page,
+    );
+    scene.stroke(
+        &Stroke::new(1.8),
+        t,
+        Color::from_rgb8(0xD8, 0xDC, 0xE8),
+        None,
+        &front_page,
+    );
+
     // Close button at top-right. Unlike collapse, this exits keyb and removes
     // its native surface completely.
     let btn = close_button_rect(lw);
@@ -537,8 +579,9 @@ fn hsl(h: f64, s: f64, l: f64) -> Color {
 #[cfg(test)]
 mod tests {
     use super::{
-        box_left_edges, close_button_rect, collapse_button_rect, reset_button_rect,
-        ribbon_control_at, ribbon_text_rect, RibbonControl, LABEL_PAD, MIN_CANVAS_W, RIBBON_TEXT_X,
+        box_left_edges, close_button_rect, collapse_button_rect, copy_button_rect,
+        reset_button_rect, ribbon_control_at, ribbon_text_rect, RibbonControl, LABEL_PAD,
+        MIN_CANVAS_W, RIBBON_TEXT_X,
     };
     use crate::RIBBON_H;
     use vello::kurbo::Point;
@@ -550,8 +593,9 @@ mod tests {
         for lw in [LW, MIN_CANVAS_W] {
             let reset = reset_button_rect();
             let collapse = collapse_button_rect();
+            let copy = copy_button_rect();
             let close = close_button_rect(lw);
-            for button in [reset, collapse, close] {
+            for button in [reset, collapse, copy, close] {
                 assert!(button.x0 >= 0.0 && button.x1 <= lw, "within canvas width");
                 assert!(
                     button.y0 >= 0.0 && button.y1 <= RIBBON_H,
@@ -559,12 +603,13 @@ mod tests {
                 );
             }
             assert!(reset.x1 < collapse.x0, "left controls do not overlap");
-            assert!(collapse.x1 < close.x0, "close is separate on the right");
+            assert!(collapse.x1 < copy.x0, "copy is separate from collapse");
+            assert!(copy.x1 < close.x0, "close is separate on the right");
             assert!(reset.x0 < lw * 0.2, "reset is anchored to the left");
             assert!(close.x1 > lw * 0.8, "close is anchored to the right");
         }
         assert!(
-            collapse_button_rect().x1 < RIBBON_TEXT_X,
+            copy_button_rect().x1 < RIBBON_TEXT_X,
             "left controls do not overlap ribbon text"
         );
         assert!(
@@ -578,6 +623,7 @@ mod tests {
         for (button, expected) in [
             (reset_button_rect(), RibbonControl::Reset),
             (collapse_button_rect(), RibbonControl::Collapse),
+            (copy_button_rect(), RibbonControl::Copy),
             (close_button_rect(MIN_CANVAS_W), RibbonControl::Close),
         ] {
             assert_eq!(

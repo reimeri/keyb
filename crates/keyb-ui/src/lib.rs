@@ -66,6 +66,9 @@ pub(crate) struct Core {
     /// the collapsed handle is drawn (SPEC §7.3: dismissible overlay).
     pub visible: bool,
     pub sink: TextSink,
+    /// Lazily opened so startup still succeeds when clipboard access is
+    /// unavailable. A successful handle is retained to preserve X11 ownership.
+    clipboard: Option<arboard::Clipboard>,
     last_frame: Instant,
 }
 
@@ -80,6 +83,7 @@ impl Core {
             engaged: false,
             visible: true,
             sink,
+            clipboard: None,
             last_frame: Instant::now(),
         })
     }
@@ -100,6 +104,29 @@ impl Core {
     pub fn reset(&mut self) {
         self.engine.reset();
         self.engaged = false;
+    }
+
+    /// Copy exactly the finalized text shown before the ribbon caret. Pending
+    /// crosshair preview characters are deliberately excluded.
+    pub fn copy_committed_text(&mut self) -> Result<()> {
+        let text = self.engine.committed_text();
+        if self.clipboard.is_none() {
+            self.clipboard = Some(arboard::Clipboard::new().context("open system clipboard")?);
+        }
+        let result = self
+            .clipboard
+            .as_mut()
+            .expect("clipboard was initialized above")
+            .set_text(text);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Reconnect on the next click rather than caching a stale X11
+                // or Wayland connection after a transient failure.
+                self.clipboard = None;
+                Err(error).context("write committed text to system clipboard")
+            }
+        }
     }
 
     fn pointer_input(&self, width: f64, height: f64) -> PointerInput {

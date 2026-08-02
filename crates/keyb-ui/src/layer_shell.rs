@@ -651,6 +651,12 @@ impl PointerHandler for AppState {
                         {
                             Some(RibbonControl::Collapse) => self.set_visible(false),
                             Some(RibbonControl::Reset) => self.core.reset(),
+                            Some(RibbonControl::Copy) => {
+                                self.core.engaged = false;
+                                if let Err(error) = self.core.copy_committed_text() {
+                                    eprintln!("keyb: could not copy text: {error:#}");
+                                }
+                            }
                             Some(RibbonControl::Close) => {
                                 self.core.engaged = false;
                                 self.close_requested = true;
