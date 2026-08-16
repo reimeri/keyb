@@ -36,6 +36,30 @@ Environment-specific support:
 - **Niri:** focused-monitor following is available only in the layer-shell
   frontend when `NIRI_SOCKET` is present.
 
+## NixOS
+
+Flake outputs: `packages.default` (`keyb`) and `devShells.default`. Linux only (`x86_64-linux`, `aarch64-linux`).
+
+```bash
+nix develop          # toolchain + native libs; then ./start.sh
+nix run              # run the packaged binary
+nix build            # ./result/bin/keyb
+```
+
+Add this repo as a flake input, then install the package:
+
+```nix
+inputs.keyb.url = "github:reimeri/keyb";
+```
+
+```nix
+environment.systemPackages = [ inputs.keyb.packages.${pkgs.system}.default ];
+```
+
+The package wraps `fc-match` and a DejaVu font so `nix run` can find a sans-serif face. A graphical Wayland or X11 session with working GPU drivers (`hardware.graphics.enable`) is still required; the flake does not configure the compositor.
+
+On first run the default GGUF is still downloaded to `$XDG_DATA_HOME/keyb/models/` unless `KEYB_NO_MODEL_DOWNLOAD` is set or `KEYB_MODEL` points at an existing file.
+
 ## Run
 
 ```bash

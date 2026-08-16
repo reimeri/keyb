@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=keyb
+Comment=Mouse-driven zooming on-screen keyboard
+Exec=keyb
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;Accessibility;
