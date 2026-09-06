@@ -337,6 +337,10 @@ pub trait LanguageModel: Send {
     /// center. Async backends re-prioritize and speculate from it (§6.6).
     fn frame_hint(&mut self, center_context: &[u8]) {}
 
+    /// Auxiliary reply-to block captured from the selection (§6.8). `None`
+    /// restores committed-text-only prediction. Default: ignore.
+    fn set_context(&mut self, context: Option<&str>) {}
+
     /// The node for `context` was evicted; cancel pending work (§6.4).
     fn release(&mut self, context: &[u8]) {}
 
@@ -403,15 +407,17 @@ One dedicated thread owns the llama.cpp context. Protocol over bounded (512)
 channels, keyed by **character context**, not node id:
 
 ```
-UI → LM : Predict { ctx }   // a node was expanded with fallback sizing
-UI → LM : Hint    { ctx }   // deepest expanded node under the view center
-UI → LM : Cancel  { ctx }   // node evicted; drop pending work
-LM → UI : FromWorker { ctx, dist: Option<Vec<f64>> }
+UI → LM : Predict { ctx }              // a node was expanded with fallback sizing
+UI → LM : Hint    { ctx }              // deepest expanded node under the view center
+UI → LM : Cancel  { ctx }              // node evicted; drop pending work
+UI → LM : SetContext { text, gen }     // replace/clear the pinned context block (§6.8)
+LM → UI : FromWorker { ctx, gen, dist: Option<Vec<f64>> }
 ```
 
 - `dist: None` means "not serviced" (compute failed, or the queue shed it). Every
   `Predict` gets **exactly one** reply, so a context can never strand on fallback
-  sizing forever.
+  sizing forever. `gen` is the worker's context-block generation at reply time
+  (§6.8); the adapter drops replies whose generation is not current.
 - Sends from the UI use `try_send` and are dropped under back-pressure rather
   than blocking the frame loop; the adapter only records a request as in-flight
   when it actually entered the queue, so a shed request is re-requestable.
@@ -495,6 +501,49 @@ with a long-term record of what this user actually writes. Enabled by default;
   implementation blocked the frame loop ~72 ms on btrfs, nine times the frame
   budget (§10). A slow disk therefore costs staleness, never back-pressure.
 
+### 6.8 Auxiliary context block
+
+The user can pin a block of text they are *replying to* into the LLM prefix,
+between the preamble and the committed (injected) text. The block is not part of
+the committed buffer and is never typed into the target application.
+
+Capture is explicit: the **⧉** ribbon control reads the primary selection,
+falling back to the regular clipboard, and hands the result to
+`Engine::set_context`. Empty captures are rejected in the UI with a flash
+message. The UI keeps the last 16 KiB (`CONTEXT_MAX_BYTES`) on a char boundary
+so recent lines always survive; the worker applies a tighter token budget on
+top.
+
+`LanguageModel::set_context(Option<&str>)` replaces the block; `None` restores
+preamble-only conditioning. Models without support ignore it (the trait default).
+`Personalized` forwards to its inner model. `Engine::set_context` forwards and
+then re-requests distributions for currently visible expanded nodes (largest
+first, deduped, capped at 128) so boxes re-partition through the normal upgrade
+path. `Engine::reset` clears the block as well as zoom state; the ctx-chip
+right-click clears only the block.
+
+The llama adapter treats the block as a **generation**: each accepted change
+bumps a counter carried in `ToWorker::SetContext`, clears cache and in-flight
+markers, and drops worker replies stamped with any other generation. A shed
+`SetContext` is retried from a latest-wins outbox on `poll_upgrades`. Blank or
+unchanged text is a no-op.
+
+The worker tokenizes preamble + header + body + tail separately:
+
+- header: `The writer is replying to the following text:\n`
+- tail: `\n\nThe writer's reply:\n`
+- body token budget 1024 (header and tail subtracted), **tail-trimmed**
+
+It then rebuilds sequence 0, answers every queued `Predict` as unserviced under
+the old generation, and flushes user-text KV branches plus computed
+distributions.
+
+UI: a `ctx N` chip appears while a block is active. A preview panel shows the
+post-cap text for ~6 s after capture (hidden while steering); left-clicking the
+chip pins or dismisses it, right-clicking drops the block. Failures flash for
+~5 s. For verification the exact bytes promised to the model are also dumped to
+`$XDG_STATE_HOME/keyb/last_context.txt`.
+
 ## 7. Rendering (keyb-ui)
 
 ### 7.1 Scene
@@ -528,13 +577,14 @@ with a long-term record of what this user actually writes. Enabled by default;
 - Steering reference: a vertical origin line at 18 % of the canvas width, a
   crosshair tick at the vertical center, and — while engaged — a line from the
   crosshair to the cursor.
-- Four on-canvas controls in the ribbon: **↺** resets the engine (§5.2), **›**
-  collapses the OSK to an edge handle (§7.3), and **⎘** copies all finalized
-  committed text (excluding the dim pending preview) to the system clipboard
-  at top-left; **×** at top-right quits keyb completely. Native Wayland copy
-  uses `ext-data-control`/`wlr-data-control`, falling back to X11 clipboard
-  access when available and logging an error otherwise. A speed readout sits
-  bottom-left.
+- Five on-canvas controls in the ribbon: **↺** resets the engine (§5.2), **›**
+  collapses the OSK to an edge handle (§7.3), **⎘** copies all finalized
+  committed text (excluding the dim pending preview) to the system clipboard,
+  and **⧉** captures the primary selection (clipboard as fallback) as the LLM's
+  auxiliary context block (§6.8) at top-left; **×** at top-right quits keyb
+  completely. Native Wayland copy uses `ext-data-control`/`wlr-data-control`,
+  falling back to X11 clipboard access when available and logging an error
+  otherwise. A speed readout sits bottom-left.
 
 ### 7.2 Frame loop
 
@@ -678,6 +728,9 @@ currently an environment variable or a compiled-in default:
   Download or load failure is never fatal: keyb falls back to PPM and still works.
 - `$XDG_DATA_HOME/keyb/` — `models/` for the managed GGUF, and
   `user_model.v1.bin` for the user vocabulary (§6.7).
+- `$XDG_STATE_HOME/keyb/last_context.txt` — debug dump of the exact bytes last
+  promised to the model as an auxiliary context block (§6.8). Overwritten on
+  each successful capture; not read back.
 - **Privacy gaps against the original design**, both open:
   - the user-vocabulary store is a **binary** file, not the plain,
     hand-inspectable text the design promised (it is still user-deletable, and
@@ -724,13 +777,16 @@ What exists:
   Against the *real* tokenizer, `keyb-lm-llama/tests/real_model.rs` checks that
   upgrades are valid distributions, that the LLM beats uniform on obvious
   continuations, that healing preserves tokens spanning canonical boundaries,
-  and the §10 latency budget. It skips with a note when no model is present.
+  the §10 latency budget, and that a §6.8 context block moves predictions,
+  survives tail-trimming, and restores preamble-only conditioning when cleared.
+  It skips with a note when no model is present.
 - **Throughput harness**: a simulated "oracle steerer" (`keyb_core::sim`) with
   configurable motor noise and reaction delay steers optimally toward target
   text and reports WPM. `keyb-app/tests/oracle.rs` gates ≥ 15 WPM on PPM (flat
   and grouped alphabets, plus a rare-letter case);
   `keyb-app/tests/oracle_llm.rs` gates ≥ 25 WPM on held-out English with the LLM,
-  paced to the wall clock. `examples/bench_oracle.rs` and `examples/dbg_oracle.rs`
+  paced to the wall clock, and checks that a captured context block (§6.8)
+  changes the empty-context distribution. `examples/bench_oracle.rs` and `examples/dbg_oracle.rs`
   are the manual sweep/debug entry points.
 - **Injection**: `keyb-inject/tests/e2e_wayland.rs` round-trips commit + retract
   through a headless `sway` running `foot`, asserting the text actually lands in
@@ -756,7 +812,8 @@ Known gaps:
 4. **M4 — Polish.** 🚧 In progress.
    - done: adaptive speed control (opt-in via `KEYB_ADAPTIVE`), alphabet group
      boxes, model auto-provisioning, persistent user vocabulary (§6.7),
-     collapse handle, reset control, and UI close control.
+     auxiliary context block (§6.8), collapse handle, reset control, and UI
+     close control.
    - open: **action nodes** (§5.4), **settings UI** (§7.4), **config file and
      data-driven alphabets** (§9), **novice onboarding overlay**, **pointer
      capture** (§7.3), **UI-surfaced privacy toggle** (§9), packaging

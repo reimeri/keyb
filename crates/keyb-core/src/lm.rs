@@ -41,6 +41,12 @@ pub trait LanguageModel: Send {
     /// speculatively expand its likely children (SPEC §6.6).
     fn frame_hint(&mut self, _center_context: &[u8]) {}
 
+    /// Replace the auxiliary context block the model conditions on (SPEC
+    /// §6.8): text the user is explicitly replying to, captured from the
+    /// selection. `None` clears it, restoring committed-text-only
+    /// prediction. Models without auxiliary-context support ignore this.
+    fn set_context(&mut self, _context: Option<&str>) {}
+
     /// The node for `context` was evicted; pending work for it may be
     /// cancelled and any cache branch freed (SPEC §6.1, §6.5).
     fn release(&mut self, _context: &[u8]) {}
@@ -76,6 +82,10 @@ impl<L: LanguageModel + ?Sized> LanguageModel for Box<L> {
 
     fn frame_hint(&mut self, center_context: &[u8]) {
         (**self).frame_hint(center_context);
+    }
+
+    fn set_context(&mut self, context: Option<&str>) {
+        (**self).set_context(context);
     }
 
     fn release(&mut self, context: &[u8]) {

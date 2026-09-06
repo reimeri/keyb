@@ -340,9 +340,13 @@ impl Engine {
     /// alphabet, language model, params, and current viewport. The LM's adaptive
     /// state is rewound by replaying `unlearn` over the committed buffer in
     /// reverse commit order (the exact inverse of the commit path), so
-    /// predictions return to baseline. No `TextEvent` is emitted: text already
-    /// injected into the target application is deliberately left untouched.
+    /// predictions return to baseline; any captured context block (§6.8) is
+    /// cleared as well. No `TextEvent` is emitted: text already injected
+    /// into the target application is deliberately left untouched.
     pub fn reset(&mut self) {
+        // The captured context block (§6.8) is part of the prediction
+        // context; a reset returns to preamble-only conditioning.
+        self.lm.set_context(None);
         while let Some(sym) = self.committed.pop() {
             self.lm.unlearn(&self.committed, sym);
         }
@@ -365,6 +369,53 @@ impl Engine {
         };
         self.events.clear();
         self.last_frame_hint_node = None;
+    }
+
+    /// Replace the auxiliary prediction context (SPEC §6.8) — the text the
+    /// user is replying to, captured from the selection — and re-request
+    /// distributions for the visible tree so boxes re-partition onto it
+    /// through the normal upgrade path. `None` clears the block.
+    pub fn set_context(&mut self, context: Option<&str>) {
+        self.lm.set_context(context);
+        self.refresh_visible_predictions();
+    }
+
+    /// Re-request distributions for the expanded nodes on screen after the
+    /// LM's conditioning changed (SPEC §6.8). The synchronous answers are
+    /// discarded; what matters is that an async backend recomputes each
+    /// context and delivers upgrades, which animate in via
+    /// `apply_upgrades`. Synchronous models answer from unchanged state, so
+    /// nothing happens visually.
+    fn refresh_visible_predictions(&mut self) {
+        let w = (self.view_hi - self.view_lo).max(f64::MIN_POSITIVE);
+        let mut ctxs: Vec<(f64, Vec<u8>)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![ROOT];
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i];
+            if !n.alive || !n.expanded {
+                continue;
+            }
+            // Invisible expanded subtrees are evicted by maintain_tree, so
+            // there is nothing expanded below to re-request either.
+            if n.hi <= self.view_lo || n.lo >= self.view_hi {
+                continue;
+            }
+            // Group boxes share their nearest char ancestor's context, so
+            // the dedup set collapses those to a single request.
+            let ctx = self.context_of(i);
+            if seen.insert(ctx.clone()) {
+                ctxs.push(((n.hi - n.lo) / w, ctx));
+            }
+            stack.extend(self.nodes[i].children.iter().copied());
+        }
+        // Largest first: the async worker sheds beyond its queue bound, so
+        // spend the budget on the boxes being steered through.
+        ctxs.sort_by(|a, b| b.0.total_cmp(&a.0));
+        ctxs.truncate(128);
+        for (_, ctx) in ctxs {
+            let _ = self.lm.predict(&ctx);
+        }
     }
 
     pub fn set_viewport_px(&mut self, px: f64) {
@@ -2344,7 +2395,11 @@ mod tests {
                     },
                     1.0 / 60.0,
                 );
-                assert_eq!(e.committed_syms(), [0], "release must land the dominant box");
+                assert_eq!(
+                    e.committed_syms(),
+                    [0],
+                    "release must land the dominant box"
+                );
                 return e;
             }
             e.step(
@@ -2820,5 +2875,145 @@ mod tests {
             e.speed_bits
         );
         assert!(e.speed_bits >= e.params.min_bits_per_sec);
+    }
+
+    /// Records `set_context` calls and every `predict` context, while
+    /// concentrating probability so the tree actually expands (SPEC §6.8).
+    struct CtxLog {
+        n: usize,
+        set: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        predicts: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+    impl LanguageModel for CtxLog {
+        fn predict(&mut self, context: &[u8]) -> Vec<f64> {
+            self.predicts.lock().unwrap().push(context.to_vec());
+            let mut p = vec![0.01 / self.n as f64; self.n];
+            let prev = context.last().copied().unwrap_or(3);
+            p[PeakedModel::next_letter(prev) as usize] = 0.99;
+            let sum: f64 = p.iter().sum();
+            for v in p.iter_mut() {
+                *v /= sum;
+            }
+            p
+        }
+        fn set_context(&mut self, context: Option<&str>) {
+            self.set.lock().unwrap().push(context.map(str::to_string));
+        }
+        fn alphabet_len(&self) -> usize {
+            self.n
+        }
+    }
+
+    #[test]
+    fn set_context_forwards_and_re_requests_visible_tree() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let predicts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lm = CtxLog {
+            n,
+            set: set.clone(),
+            predicts: predicts.clone(),
+        };
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_viewport_px(900.0);
+        // Idle a few frames so the lookahead expands part of the tree.
+        for _ in 0..30 {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: false,
+                },
+                1.0 / 60.0,
+            );
+        }
+        let expanded = e.nodes.iter().filter(|n| n.expanded).count();
+        assert!(
+            expanded > 1,
+            "tree must expand for the test to mean anything"
+        );
+        let before = predicts.lock().unwrap().len();
+
+        e.set_context(Some("alice: see you thursday?"));
+        assert_eq!(
+            set.lock().unwrap().as_slice(),
+            &[Some("alice: see you thursday?".to_string())]
+        );
+        let after: Vec<Vec<u8>> = predicts.lock().unwrap()[before..].to_vec();
+        assert!(
+            !after.is_empty(),
+            "set_context must re-request the visible tree"
+        );
+        // The frame root (empty relative context on a fresh engine) is the
+        // largest box on screen and must be among the re-requests.
+        assert!(
+            after.iter().any(|c| c.is_empty()),
+            "root context re-requested: {after:?}"
+        );
+        // No duplicates: group boxes share their char ancestor's context.
+        let mut dedup = after.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(after.len(), dedup.len(), "contexts must be deduped");
+    }
+
+    #[test]
+    fn reset_clears_context_block() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lm = CtxLog {
+            n,
+            set: set.clone(),
+            predicts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_context(Some("chat log"));
+        e.reset();
+        assert_eq!(
+            set.lock().unwrap().as_slice(),
+            &[Some("chat log".to_string()), None],
+            "reset must return the LM to preamble-only conditioning"
+        );
+    }
+
+    #[test]
+    fn set_context_none_clears_without_reset() {
+        let a = Alphabet::english_v1();
+        let n = a.len();
+        let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let predicts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lm = CtxLog {
+            n,
+            set: set.clone(),
+            predicts: predicts.clone(),
+        };
+        let mut e = Engine::new(a, Box::new(lm), EngineParams::default());
+        e.set_viewport_px(900.0);
+        for _ in 0..8 {
+            e.step(
+                PointerInput {
+                    dx: 0.0,
+                    y: 0.5,
+                    engaged: false,
+                },
+                1.0 / 60.0,
+            );
+        }
+        e.set_context(Some("chat log"));
+        let before = predicts.lock().unwrap().len();
+        e.set_context(None);
+        assert_eq!(
+            set.lock().unwrap().as_slice(),
+            &[Some("chat log".to_string()), None],
+            "clearing the block must not require a full reset"
+        );
+        assert!(
+            predicts.lock().unwrap().len() > before,
+            "clearing still re-requests the visible tree"
+        );
+        // Zoom state is untouched: reset would also empty the committed buffer.
+        assert!(e.committed.is_empty());
     }
 }

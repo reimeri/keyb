@@ -16,7 +16,7 @@ mod niri_focus;
 mod scene;
 mod winit_shell;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use keyb_core::{Engine, PointerInput, TextEvent};
@@ -39,6 +39,29 @@ pub const OSK_W: u32 = 620;
 pub const HANDLE_W: u32 = 28;
 pub const HANDLE_H: u32 = 110;
 
+/// Byte cap for a captured context block (SPEC §6.8); the tail is kept, so
+/// the most recent text always survives. The LLM worker applies its own
+/// tighter token budget on top.
+pub const CONTEXT_MAX_BYTES: usize = 16 * 1024;
+/// How long the context preview panel stays up after a capture.
+const CONTEXT_PREVIEW_SECS: f64 = 6.0;
+/// How long a capture-failure message stays up.
+const CONTEXT_ERROR_SECS: f64 = 5.0;
+
+/// The captured context block (SPEC §6.8) as the UI promised it to the model.
+pub struct ContextState {
+    /// Post-cap text handed to `Engine::set_context`.
+    text: String,
+    /// Display count, computed once at capture.
+    chars: usize,
+    /// The raw capture exceeded the byte cap; the panel notes the trim.
+    trimmed: bool,
+    /// Transient post-capture confirmation deadline.
+    preview_until: Instant,
+    /// Chip click pins the panel open; another click dismisses it.
+    pinned: bool,
+}
+
 /// Receives committed-text changes once per frame, on the UI thread.
 pub type TextSink = Box<dyn FnMut(TextEvent)>;
 
@@ -59,7 +82,8 @@ pub(crate) struct Core {
     pub engine: Engine,
     pub fonts: font::FontAssets,
     pub scene: Scene,
-    ribbon: scene::RibbonCache,
+    /// Hit-test cache for the ctx chip (SPEC §6.8); frontends read it.
+    pub(crate) ribbon: scene::RibbonCache,
     pub cursor: (f64, f64),
     pub engaged: bool,
     /// Whether the OSK is expanded. When false the engine is frozen and only
@@ -69,6 +93,10 @@ pub(crate) struct Core {
     /// Lazily opened so startup still succeeds when clipboard access is
     /// unavailable. A successful handle is retained to preserve X11 ownership.
     clipboard: Option<arboard::Clipboard>,
+    /// Active context block (SPEC §6.8), shown as a ribbon chip.
+    context: Option<ContextState>,
+    /// Transient capture-failure message shown in place of the preview.
+    flash: Option<(String, Instant)>,
     last_frame: Instant,
 }
 
@@ -84,6 +112,8 @@ impl Core {
             visible: true,
             sink,
             clipboard: None,
+            context: None,
+            flash: None,
             last_frame: Instant::now(),
         })
     }
@@ -101,9 +131,72 @@ impl Core {
 
     /// Reset the engine to its start state and drop any in-progress steering.
     /// Text already injected into the target app is left untouched (SPEC §7).
+    /// The captured context block goes too: `Engine::reset` clears it on the
+    /// LM side (SPEC §6.8), and the UI drops its display copy here.
     pub fn reset(&mut self) {
         self.engine.reset();
+        self.context = None;
+        self.flash = None;
         self.engaged = false;
+    }
+
+    /// Capture the primary selection (falling back to the clipboard) as the
+    /// LLM's auxiliary context block (SPEC §6.8), and show the preview panel
+    /// so the user can verify what the model will see.
+    pub fn capture_context(&mut self) {
+        match self.read_selection() {
+            Ok(raw) => {
+                let capped = cap_tail(&raw, CONTEXT_MAX_BYTES).to_string();
+                self.engine.set_context(Some(&capped));
+                dump_context(&capped);
+                self.flash = None;
+                self.context = Some(ContextState {
+                    chars: capped.chars().count(),
+                    trimmed: capped.len() < raw.len(),
+                    text: capped,
+                    preview_until: Instant::now() + Duration::from_secs_f64(CONTEXT_PREVIEW_SECS),
+                    pinned: false,
+                });
+            }
+            Err(error) => {
+                self.flash = Some((
+                    format!("{error:#}"),
+                    Instant::now() + Duration::from_secs_f64(CONTEXT_ERROR_SECS),
+                ));
+            }
+        }
+    }
+
+    /// Left-click on the ctx chip: pin the preview panel open or dismiss it.
+    pub fn toggle_context_preview(&mut self) {
+        if let Some(c) = &mut self.context {
+            c.pinned = !c.pinned;
+        }
+    }
+
+    /// Right-click on the ctx chip: drop the context block without touching
+    /// zoom state or committed text.
+    pub fn clear_context(&mut self) {
+        if self.context.take().is_some() {
+            self.engine.set_context(None);
+        }
+    }
+
+    /// Read the text the user most likely means as context: the primary
+    /// selection (mark text, click ⧉ — no copying step), falling back to the
+    /// regular clipboard for compositors without primary selection and for
+    /// Ctrl+C habits.
+    fn read_selection(&mut self) -> Result<String> {
+        if self.clipboard.is_none() {
+            self.clipboard = Some(arboard::Clipboard::new().context("open system clipboard")?);
+        }
+        let result = read_selection_text(self.clipboard.as_mut().expect("initialized above"));
+        if result.is_err() {
+            // Reconnect on the next click rather than trusting a connection
+            // that just failed (same discipline as copy_committed_text).
+            self.clipboard = None;
+        }
+        result
     }
 
     /// Copy exactly the finalized text shown before the ribbon caret. Pending
@@ -169,6 +262,7 @@ impl Core {
             (self.sink)(ev);
         }
 
+        let ctx_view = context_view(&self.context, &self.flash, self.engaged);
         scene::build(
             &mut self.scene,
             &mut self.ribbon,
@@ -177,8 +271,96 @@ impl Core {
             (lw, lh, scale),
             input,
             self.cursor,
+            ctx_view,
         );
     }
+}
+
+/// What the scene needs to draw the context UI this frame: the chip while
+/// a block is active, plus the panel while transiently or pinned visible.
+/// The transient confirmation hides while steering; the pinned panel and
+/// error flash stay. A free function over disjoint fields, so `tick` can
+/// borrow the scene and ribbon mutably at the same time.
+fn context_view<'a>(
+    context: &'a Option<ContextState>,
+    flash: &'a Option<(String, Instant)>,
+    engaged: bool,
+) -> scene::CtxView<'a> {
+    let now = Instant::now();
+    if let Some((msg, until)) = flash {
+        if now < *until {
+            return scene::CtxView {
+                chip: context.as_ref().map(|c| c.chars),
+                panel: Some(scene::PanelView {
+                    title: "context capture failed".into(),
+                    body: msg.as_str(),
+                    error: true,
+                }),
+            };
+        }
+    }
+    let panel = context.as_ref().and_then(|c| {
+        let transient = now < c.preview_until && !engaged;
+        (c.pinned || transient).then(|| scene::PanelView {
+            title: if c.trimmed {
+                format!("context — {} chars (tail of a longer capture)", c.chars)
+            } else {
+                format!("context — {} chars", c.chars)
+            },
+            body: c.text.as_str(),
+            error: false,
+        })
+    });
+    scene::CtxView {
+        chip: context.as_ref().map(|c| c.chars),
+        panel,
+    }
+}
+
+/// Keep the last `max` bytes of `text`, on a char boundary: recent context
+/// matters more than the beginning of a capture.
+fn cap_tail(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn read_selection_text(cb: &mut arboard::Clipboard) -> Result<String> {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+    let primary = cb.get().clipboard(LinuxClipboardKind::Primary).text();
+    let text = match primary {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            let t = cb.get_text().context("read selection or clipboard")?;
+            if t.trim().is_empty() {
+                anyhow::bail!("nothing selected, and the clipboard is empty");
+            }
+            t
+        }
+    };
+    Ok(text)
+}
+
+/// Debug/verification dump of the exact bytes promised to the model:
+/// `$XDG_STATE_HOME/keyb/last_context.txt` (SPEC §6.8). A few KB written on
+/// a deliberate click — infrequent enough to stay on the UI thread.
+fn dump_context(text: &str) {
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+        .map(|d| d.join("keyb"));
+    let Some(dir) = dir else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join("last_context.txt"), text);
 }
 
 /// One vello render context + per-device renderers, shared by frontends.
@@ -290,6 +472,106 @@ impl Gpu {
             .context("render vello scene")?;
         surface_texture.present();
         Ok(RenderOutcome::Presented)
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::{cap_tail, context_view, ContextState, CONTEXT_MAX_BYTES};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cap_tail_keeps_recent_bytes_on_a_char_boundary() {
+        assert_eq!(cap_tail("hello", 16), "hello");
+        assert_eq!(cap_tail("abcdefgh", 8), "abcdefgh");
+        assert_eq!(cap_tail("abcdefgh", 4), "efgh");
+        // "aé" is 1 + 2 bytes; max=2 lands on the start of é.
+        assert_eq!(cap_tail("aé", 2), "é");
+        // max=1 cannot fit é, so the slice is empty rather than a partial char.
+        assert_eq!(cap_tail("aé", 1), "");
+        let long = "x".repeat(CONTEXT_MAX_BYTES + 10);
+        let kept = cap_tail(&long, CONTEXT_MAX_BYTES);
+        assert_eq!(kept.len(), CONTEXT_MAX_BYTES);
+        assert!(long.ends_with(kept));
+    }
+
+    fn sample(text: &str, trimmed: bool, preview_until: Instant, pinned: bool) -> ContextState {
+        ContextState {
+            chars: text.chars().count(),
+            trimmed,
+            text: text.to_string(),
+            preview_until,
+            pinned,
+        }
+    }
+
+    #[test]
+    fn context_view_hides_everything_when_idle() {
+        let v = context_view(&None, &None, false);
+        assert!(v.chip.is_none());
+        assert!(v.panel.is_none());
+    }
+
+    #[test]
+    fn context_view_flash_wins_while_live() {
+        let context = Some(sample(
+            "hello",
+            false,
+            Instant::now() + Duration::from_secs(10),
+            false,
+        ));
+        let flash = Some(("boom".into(), Instant::now() + Duration::from_secs(5)));
+        let v = context_view(&context, &flash, false);
+        assert_eq!(v.chip, Some(5));
+        let panel = v.panel.expect("error panel");
+        assert!(panel.error);
+        assert_eq!(panel.body, "boom");
+        assert!(panel.title.contains("failed"));
+    }
+
+    #[test]
+    fn context_view_expired_flash_falls_through_to_preview() {
+        let context = Some(sample(
+            "hello",
+            false,
+            Instant::now() + Duration::from_secs(10),
+            false,
+        ));
+        let flash = Some(("boom".into(), Instant::now() - Duration::from_secs(1)));
+        let v = context_view(&context, &flash, false);
+        let panel = v.panel.expect("preview");
+        assert!(!panel.error);
+        assert_eq!(panel.body, "hello");
+        assert!(panel.title.contains("5 chars"));
+    }
+
+    #[test]
+    fn context_view_transient_hides_while_steering() {
+        let context = Some(sample(
+            "hello",
+            false,
+            Instant::now() + Duration::from_secs(10),
+            false,
+        ));
+        let v = context_view(&context, &None, true);
+        assert_eq!(v.chip, Some(5));
+        assert!(v.panel.is_none(), "steering hides the confirmation");
+    }
+
+    #[test]
+    fn context_view_pinned_survives_steering_and_expiry() {
+        let context = Some(sample(
+            "hello",
+            true,
+            Instant::now() - Duration::from_secs(1),
+            true,
+        ));
+        let v = context_view(&context, &None, true);
+        assert_eq!(v.chip, Some(5));
+        let panel = v.panel.expect("pinned");
+        assert!(!panel.error);
+        assert!(panel.title.contains("tail"));
+        assert_eq!(panel.body, "hello");
     }
 }
 

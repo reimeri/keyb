@@ -45,11 +45,13 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-use crate::scene::{ribbon_control_at, RibbonControl};
+use crate::scene::{context_chip_hit, ribbon_control_at, RibbonControl};
 use crate::{osk_width, Core, Gpu, RenderOutcome, HANDLE_H, HANDLE_W};
 
 /// Left mouse button, evdev code (input-event-codes.h BTN_LEFT).
 const BTN_LEFT: u32 = 0x110;
+/// Right mouse button, evdev code (BTN_RIGHT) — clears the ctx chip.
+const BTN_RIGHT: u32 = 0x111;
 const FOCUS_RETRY_MIN: Duration = Duration::from_secs(1);
 const FOCUS_RETRY_MAX: Duration = Duration::from_secs(30);
 
@@ -646,6 +648,9 @@ impl PointerHandler for AppState {
                     if !self.core.visible {
                         // Any tap on the collapsed handle reopens the OSK.
                         self.set_visible(true);
+                    } else if context_chip_hit(&self.core.ribbon, vello::kurbo::Point::new(cx, cy))
+                    {
+                        self.core.toggle_context_preview();
                     } else {
                         match ribbon_control_at(self.width as f64, vello::kurbo::Point::new(cx, cy))
                         {
@@ -657,6 +662,10 @@ impl PointerHandler for AppState {
                                     eprintln!("keyb: could not copy text: {error:#}");
                                 }
                             }
+                            Some(RibbonControl::CaptureContext) => {
+                                self.core.engaged = false;
+                                self.core.capture_context();
+                            }
                             Some(RibbonControl::Close) => {
                                 self.core.engaged = false;
                                 self.close_requested = true;
@@ -664,6 +673,12 @@ impl PointerHandler for AppState {
                             }
                             None => self.core.engaged = true,
                         }
+                    }
+                }
+                PointerEventKind::Press { button, .. } if button == BTN_RIGHT => {
+                    let (cx, cy) = self.core.cursor;
+                    if context_chip_hit(&self.core.ribbon, vello::kurbo::Point::new(cx, cy)) {
+                        self.core.clear_context();
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {

@@ -72,6 +72,16 @@ pub struct LlamaLm {
     rx: Receiver<FromWorker>,
     last_hint: Option<Vec<u8>>,
     worker_gone: bool,
+    /// Context generation (SPEC §6.8): bumped per accepted `set_context`,
+    /// carried in `ToWorker::SetContext` so a shed delivery cannot
+    /// desynchronize the worker. Replies stamped with any other generation
+    /// were computed under a replaced context block and are dropped.
+    gen: u64,
+    /// The context block last handed to the worker (`None` = preamble only).
+    last_context: Option<String>,
+    /// A `SetContext` that did not fit the channel, retried from
+    /// `poll_upgrades`. Latest-wins: an undelivered older block is worthless.
+    context_outbox: Option<Option<String>>,
     _worker: std::thread::JoinHandle<()>,
 }
 
@@ -114,6 +124,9 @@ impl LlamaLm {
             rx,
             last_hint: None,
             worker_gone: false,
+            gen: 0,
+            last_context: None,
+            context_outbox: None,
             _worker: handle,
         })
     }
@@ -147,7 +160,9 @@ impl LlamaLm {
             Err(TrySendError::Disconnected(_)) => {
                 if !self.worker_gone {
                     self.worker_gone = true;
-                    eprintln!("keyb-lm-llama: inference worker gone — cached + PPM only from here on");
+                    eprintln!(
+                        "keyb-lm-llama: inference worker gone — cached + PPM only from here on"
+                    );
                 }
                 false
             }
@@ -174,8 +189,25 @@ impl LanguageModel for LlamaLm {
     }
 
     fn poll_upgrades(&mut self) -> Vec<(Vec<u8>, Vec<f64>)> {
+        // Retry an undelivered context change before accepting answers, so
+        // the generation gate below validates against the newest state.
+        if let Some(text) = self.context_outbox.take() {
+            if !self.send(ToWorker::SetContext {
+                text: text.clone(),
+                gen: self.gen,
+            }) {
+                self.context_outbox = Some(text);
+            }
+        }
         let mut out = Vec::new();
-        while let Ok(FromWorker { ctx, dist }) = self.rx.try_recv() {
+        while let Ok(FromWorker { ctx, gen, dist }) = self.rx.try_recv() {
+            // Stale era: computed under a replaced context block. Markers
+            // were all cleared when the change was accepted, so a stale
+            // reply must not touch `pending` — it could belong to a
+            // re-issued request that is still in flight.
+            if gen != self.gen {
+                continue;
+            }
             let Some(raw) = dist else {
                 // Not serviced (compute failed or the queue shed it): clear
                 // the in-flight marker so a later predict re-requests. The
@@ -214,6 +246,32 @@ impl LanguageModel for LlamaLm {
         }
     }
 
+    /// SPEC §6.8: hand a new context block to the worker and invalidate
+    /// everything derived from the old one. In-flight markers are cleared
+    /// wholesale: their requests will be answered (exactly-once) with a
+    /// stale generation and dropped, while the engine immediately
+    /// re-requests the visible tree under the new generation.
+    fn set_context(&mut self, context: Option<&str>) {
+        let context = context.filter(|t| !t.trim().is_empty());
+        if self.last_context.as_deref() == context {
+            return;
+        }
+        self.last_context = context.map(str::to_string);
+        self.gen += 1;
+        self.cache.clear();
+        self.pending.clear();
+        if self.send(ToWorker::SetContext {
+            text: self.last_context.clone(),
+            gen: self.gen,
+        }) {
+            // A later successful delivery must not let poll_upgrades replay a
+            // previously shed older block under this generation.
+            self.context_outbox = None;
+        } else {
+            self.context_outbox = Some(self.last_context.clone());
+        }
+    }
+
     fn release(&mut self, context: &[u8]) {
         if self.pending.remove(context) {
             self.send(ToWorker::Cancel {
@@ -232,5 +290,224 @@ impl LanguageModel for LlamaLm {
 
     fn alphabet_len(&self) -> usize {
         self.n_sym
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::{bounded, Receiver};
+
+    /// A `LlamaLm` wired to test-controlled channel ends instead of the real
+    /// inference worker, so the generation protocol (SPEC §6.8) can be
+    /// exercised without a model.
+    fn test_lm() -> (
+        LlamaLm,
+        Receiver<ToWorker>,
+        crossbeam_channel::Sender<FromWorker>,
+    ) {
+        let alphabet = Alphabet::english_v1();
+        let n_sym = alphabet.len();
+        let (tx, worker_rx) = bounded::<ToWorker>(512);
+        let (worker_tx, rx) = bounded::<FromWorker>(512);
+        let lm = LlamaLm {
+            ppm: PpmModel::seeded(&alphabet),
+            n_sym,
+            lambda: 0.05,
+            p_min: 1e-4,
+            cache: HashMap::new(),
+            pending: HashSet::new(),
+            tx,
+            rx,
+            last_hint: None,
+            worker_gone: false,
+            gen: 0,
+            last_context: None,
+            context_outbox: None,
+            _worker: std::thread::spawn(|| {}),
+        };
+        (lm, worker_rx, worker_tx)
+    }
+
+    #[test]
+    fn set_context_sends_generation_and_invalidates() {
+        let (mut lm, worker_rx, _wtx) = test_lm();
+        // Pre-populate cache and an in-flight marker: both belong to the old
+        // generation and must be invalidated by the change.
+        lm.cache
+            .insert(b"ab".to_vec(), vec![1.0 / lm.n_sym as f64; lm.n_sym]);
+        lm.pending.insert(b"ab".to_vec());
+
+        lm.set_context(Some("alice: see you thursday?"));
+
+        let msg = worker_rx.try_recv().expect("SetContext must be sent");
+        match msg {
+            ToWorker::SetContext { text, gen } => {
+                assert_eq!(text.as_deref(), Some("alice: see you thursday?"));
+                assert_eq!(gen, 1, "first change bumps generation to 1");
+            }
+            other => panic!("expected SetContext, got {other:?}"),
+        }
+        assert!(lm.cache.is_empty(), "cache is old-context data");
+        assert!(lm.pending.is_empty(), "markers are old-generation state");
+        assert!(lm.context_outbox.is_none());
+    }
+
+    #[test]
+    fn set_context_unchanged_is_noop() {
+        let (mut lm, worker_rx, _wtx) = test_lm();
+        lm.set_context(None);
+        lm.set_context(Some("chat log"));
+        lm.set_context(Some("chat log"));
+        let mut sent = 0;
+        while worker_rx.try_recv().is_ok() {
+            sent += 1;
+        }
+        assert_eq!(sent, 1, "only the real change is sent");
+        assert_eq!(lm.gen, 1);
+    }
+
+    #[test]
+    fn stale_generation_replies_are_dropped() {
+        let (mut lm, _worker_rx, worker_tx) = test_lm();
+        lm.set_context(Some("context A")); // gen 1
+                                           // A request issued under the new generation gets its marker.
+        let ctx = b"hello".to_vec();
+        let _ = lm.predict(&ctx);
+        assert!(lm.pending.contains(&ctx));
+
+        // A reply from before the change: dropped without touching markers.
+        worker_tx
+            .send(FromWorker {
+                ctx: ctx.clone(),
+                gen: 0,
+                dist: Some(vec![1.0 / lm.n_sym as f64; lm.n_sym]),
+            })
+            .unwrap();
+        assert!(lm.poll_upgrades().is_empty());
+        assert!(
+            lm.pending.contains(&ctx),
+            "stale reply must not clear a new-generation marker"
+        );
+        assert!(lm.cache.is_empty(), "stale data must never be cached");
+
+        // The current-generation answer lands normally.
+        worker_tx
+            .send(FromWorker {
+                ctx: ctx.clone(),
+                gen: 1,
+                dist: Some(vec![1.0 / lm.n_sym as f64; lm.n_sym]),
+            })
+            .unwrap();
+        let upgrades = lm.poll_upgrades();
+        assert_eq!(upgrades.len(), 1, "fresh reply upgrades the node");
+        assert_eq!(upgrades[0].0, ctx);
+        assert!(!lm.pending.contains(&ctx));
+    }
+
+    #[test]
+    fn shed_set_context_retries_from_outbox() {
+        let (mut lm, worker_rx, _wtx) = test_lm();
+        // Fill the control channel so the SetContext send is shed.
+        while lm.tx.try_send(ToWorker::Hint { ctx: vec![] }).is_ok() {}
+        lm.set_context(Some("deferred context"));
+        assert_eq!(
+            lm.context_outbox,
+            Some(Some("deferred context".to_string())),
+            "shed SetContext parks in the outbox"
+        );
+
+        // The worker drains; the next poll_upgrades retries the delivery.
+        while worker_rx.try_recv().is_ok() {}
+        assert!(lm.poll_upgrades().is_empty());
+        assert!(lm.context_outbox.is_none(), "outbox flushed");
+        match worker_rx.try_recv() {
+            Ok(ToWorker::SetContext { text, gen }) => {
+                assert_eq!(text.as_deref(), Some("deferred context"));
+                assert_eq!(gen, lm.gen, "carries the adapter generation");
+            }
+            other => panic!("expected SetContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_context_empty_or_whitespace_is_noop() {
+        let (mut lm, worker_rx, _wtx) = test_lm();
+        lm.set_context(Some(""));
+        lm.set_context(Some("  \n\t"));
+        lm.set_context(None);
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "blank context is preamble-only, same as the initial state"
+        );
+        assert_eq!(lm.gen, 0);
+        assert!(lm.last_context.is_none());
+    }
+
+    #[test]
+    fn set_context_none_clears_an_active_block() {
+        let (mut lm, worker_rx, _wtx) = test_lm();
+        lm.set_context(Some("chat log"));
+        assert!(worker_rx.try_recv().is_ok());
+        lm.set_context(None);
+        match worker_rx.try_recv() {
+            Ok(ToWorker::SetContext { text, gen }) => {
+                assert_eq!(text, None);
+                assert_eq!(gen, 2);
+            }
+            other => panic!("expected clearing SetContext, got {other:?}"),
+        }
+        assert!(lm.last_context.is_none());
+        assert!(lm.cache.is_empty());
+        assert!(lm.pending.is_empty());
+    }
+
+    #[test]
+    fn shed_set_context_latest_wins_in_outbox() {
+        let (mut lm, _worker_rx, _wtx) = test_lm();
+        while lm.tx.try_send(ToWorker::Hint { ctx: vec![] }).is_ok() {}
+        lm.set_context(Some("first"));
+        lm.set_context(Some("second"));
+        assert_eq!(lm.gen, 2);
+        assert_eq!(
+            lm.context_outbox,
+            Some(Some("second".to_string())),
+            "an undelivered older block is worthless"
+        );
+    }
+
+    #[test]
+    fn successful_set_context_drops_a_shed_older_outbox() {
+        let (mut lm, worker_rx, _wtx) = test_lm();
+        while lm.tx.try_send(ToWorker::Hint { ctx: vec![] }).is_ok() {}
+        lm.set_context(Some("first"));
+        assert_eq!(
+            lm.context_outbox,
+            Some(Some("first".to_string())),
+            "first change is shed"
+        );
+
+        // Worker drains; the next change must deliver and forget the outbox,
+        // otherwise poll_upgrades would replay "first" under generation 2.
+        while worker_rx.try_recv().is_ok() {}
+        lm.set_context(Some("second"));
+        assert!(
+            lm.context_outbox.is_none(),
+            "delivered change must not leave a stale outbox: {:?}",
+            lm.context_outbox
+        );
+        match worker_rx.try_recv() {
+            Ok(ToWorker::SetContext { text, gen }) => {
+                assert_eq!(text.as_deref(), Some("second"));
+                assert_eq!(gen, 2);
+            }
+            other => panic!("expected SetContext(second), got {other:?}"),
+        }
+        assert!(worker_rx.try_recv().is_err(), "no extra SetContext queued");
+        assert!(lm.poll_upgrades().is_empty());
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "poll_upgrades must not replay the shed first block"
+        );
     }
 }

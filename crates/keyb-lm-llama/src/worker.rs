@@ -28,6 +28,7 @@ use llama_cpp_2::token::LlamaToken;
 use crate::marginal::VocabIndex;
 use crate::LlamaConfig;
 
+#[derive(Debug)]
 pub enum ToWorker {
     /// The engine expanded a node with fallback sizing; compute the real
     /// distribution for this context.
@@ -37,10 +38,25 @@ pub enum ToWorker {
     Hint { ctx: Vec<u8> },
     /// The node was evicted; drop pending work for this context.
     Cancel { ctx: Vec<u8> },
+    /// Replace the pinned context block (SPEC §6.8): text the user is
+    /// replying to, decoded into the prefix between the preamble and the
+    /// committed text. `None` restores the preamble-only prefix. `gen` is
+    /// the adapter's generation counter — carried in the message (rather
+    /// than incremented here) so a shed-and-retried delivery can never
+    /// desynchronize the two sides. Every queued request is answered "not
+    /// serviced" under the old generation; all branches and computed
+    /// distributions are then flushed.
+    SetContext { text: Option<String>, gen: u64 },
 }
 
 pub struct FromWorker {
     pub ctx: Vec<u8>,
+    /// Context generation this answer belongs to (SPEC §6.8): the worker's
+    /// generation counter at reply time, bumped by every `SetContext`.
+    /// Answers from before the adapter's current generation are stale —
+    /// computed under a replaced context block — and must be dropped
+    /// without touching in-flight markers.
+    pub gen: u64,
     /// Raw LLM char distribution over the alphabet (pre-smoothing). Sums to 1
     /// unless everything was out-of-alphabet (then it is all zeros and the
     /// adapter keeps its fallback). `None` means the request was not serviced
@@ -66,6 +82,18 @@ const MAX_PENDING: usize = 256;
 const WINDOW: usize = 800;
 const WINDOW_STEP: usize = 256;
 
+/// Framing for the captured context block (SPEC §6.8). The block sits in the
+/// pinned prefix between the preamble and the committed text, so the user's
+/// text continues naturally from what they are replying to. Kept deliberately
+/// plain — the small default model follows a transcript far better than a
+/// chat template.
+const CONTEXT_HEADER: &str = "The writer is replying to the following text:\n";
+const CONTEXT_TAIL: &str = "\n\nThe writer's reply:\n";
+/// Token budget for the context block body (header and tail excluded):
+/// tail-trimmed so the most recent lines always survive. Preamble (~30) +
+/// block (~1050) + window (~250) stays well under `n_ctx`.
+const CONTEXT_MAX_TOKENS: usize = 1024;
+
 struct Branch {
     seq: i32,
     /// softmax over the whole vocab at this branch point.
@@ -78,9 +106,19 @@ struct Worker<'m> {
     ctx: LlamaContext<'m>,
     vocab: VocabIndex,
     alphabet: Alphabet,
+    /// Length of the pinned prefix (preamble + optional context block) —
+    /// the position offset of every user-text token.
     n_preamble: i32,
-    /// Branches keyed by user-text token sequence (preamble implicit).
-    /// The empty key (preamble only, seq 0) is pinned.
+    /// The captured context block as last accepted (`None` = preamble only).
+    context_text: Option<String>,
+    /// Context generation: bumped per accepted `SetContext`, stamped onto
+    /// every reply so the adapter can drop stale answers.
+    gen: u64,
+    /// Branch budget beyond the pinned prefix (from config); the free list
+    /// is rebuilt to this after a context change flushes all branches.
+    max_branches: usize,
+    /// Branches keyed by user-text token sequence (prefix implicit).
+    /// The empty key (prefix only, seq 0) is pinned.
     branches: HashMap<Box<[LlamaToken]>, Branch>,
     free_seqs: Vec<i32>,
     tick: u64,
@@ -95,6 +133,71 @@ impl<'m> Worker<'m> {
         if let Some(b) = self.branches.get_mut(key) {
             b.last_used = self.tick;
         }
+    }
+
+    /// Tokenize the pinned prefix: the preamble, then — when a context block
+    /// is set — header + tail-trimmed body + tail (SPEC §6.8). The parts are
+    /// tokenized separately so the budget trims exactly the body; the
+    /// boundaries fall on newlines, where BPE merging is a no-op in practice.
+    fn prefix_tokens(&self) -> Result<Vec<LlamaToken>, String> {
+        let mut toks = self
+            .model
+            .str_to_token(PREAMBLE, AddBos::Never)
+            .map_err(|e| format!("preamble tokenize: {e}"))?;
+        if let Some(ctx) = &self.context_text {
+            let head = self
+                .model
+                .str_to_token(CONTEXT_HEADER, AddBos::Never)
+                .map_err(|e| format!("context header tokenize: {e}"))?;
+            let mut body = self
+                .model
+                .str_to_token(ctx, AddBos::Never)
+                .map_err(|e| format!("context tokenize: {e}"))?;
+            let tail = self
+                .model
+                .str_to_token(CONTEXT_TAIL, AddBos::Never)
+                .map_err(|e| format!("context tail tokenize: {e}"))?;
+            let budget = CONTEXT_MAX_TOKENS.saturating_sub(head.len() + tail.len());
+            if body.len() > budget {
+                body.drain(..body.len() - budget);
+            }
+            toks.extend_from_slice(&head);
+            toks.extend_from_slice(&body);
+            toks.extend_from_slice(&tail);
+        }
+        Ok(toks)
+    }
+
+    /// Decode the pinned prefix into sequence 0, replacing the pinned
+    /// empty-key branch's distribution. Callers changing the context block
+    /// must flush all other branches right after: their KV shares prefix
+    /// cells with seq 0, which this rewrites.
+    fn rebuild_prefix(&mut self) -> Result<(), String> {
+        let toks = self.prefix_tokens()?;
+        self.ctx
+            .clear_kv_cache_seq(Some(0), None, None)
+            .map_err(|e| format!("kv clear: {e}"))?;
+        let mut batch = LlamaBatch::new(toks.len(), 1);
+        for (i, &t) in toks.iter().enumerate() {
+            batch
+                .add(t, i as i32, &[0], i + 1 == toks.len())
+                .map_err(|e| format!("batch add: {e}"))?;
+        }
+        self.ctx
+            .decode(&mut batch)
+            .map_err(|e| format!("prefix decode: {e}"))?;
+        self.n_preamble = toks.len() as i32;
+        let probs: Arc<[f32]> = softmax(self.ctx.get_logits_ith(batch.n_tokens() - 1)).into();
+        self.tick += 1;
+        self.branches.insert(
+            Vec::new().into_boxed_slice(),
+            Branch {
+                seq: 0,
+                probs,
+                last_used: self.tick,
+            },
+        );
+        Ok(())
     }
 
     /// Sequence id for `tokens`, creating the branch (prefix copy + decode of
@@ -346,51 +449,21 @@ pub fn run(
         vocab,
         alphabet,
         n_preamble: 0,
+        context_text: None,
+        gen: 0,
+        max_branches: cfg.max_branches,
         branches: HashMap::new(),
         free_seqs: (1..cfg.max_branches as i32 + 1).rev().collect(),
         tick: 0,
         computed: HashMap::new(),
     };
 
-    // Warm the pinned preamble branch (seq 0) so the first prediction is one
-    // prefix-copy + short decode away.
-    let warm = || -> Result<(Vec<LlamaToken>, ()), String> {
-        w.model
-            .str_to_token(PREAMBLE, AddBos::Never)
-            .map_err(|e| format!("preamble tokenize: {e}"))
-            .map(|t| (t, ()))
-    };
-    let preamble_toks = match warm() {
-        Ok((t, ())) => t,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
-    let mut batch = LlamaBatch::new(preamble_toks.len(), 1);
-    for (i, &t) in preamble_toks.iter().enumerate() {
-        if batch
-            .add(t, i as i32, &[0], i + 1 == preamble_toks.len())
-            .is_err()
-        {
-            let _ = ready.send(Err("preamble batch".into()));
-            return;
-        }
-    }
-    if let Err(e) = w.ctx.decode(&mut batch) {
-        let _ = ready.send(Err(format!("preamble decode: {e}")));
+    // Warm the pinned prefix branch (seq 0) so the first prediction is one
+    // prefix-copy + short decode away. No context block exists at startup.
+    if let Err(e) = w.rebuild_prefix() {
+        let _ = ready.send(Err(e));
         return;
     }
-    w.n_preamble = preamble_toks.len() as i32;
-    let probs: Arc<[f32]> = softmax(w.ctx.get_logits_ith(batch.n_tokens() - 1)).into();
-    w.branches.insert(
-        Vec::new().into_boxed_slice(),
-        Branch {
-            seq: 0,
-            probs,
-            last_used: 0,
-        },
-    );
     let _ = ready.send(Ok(()));
 
     // Request state: newest-first, hint-adjacent boosted, cancellable.
@@ -427,6 +500,7 @@ pub fn run(
                         if tx
                             .send(FromWorker {
                                 ctx: old,
+                                gen: w.gen,
                                 dist: None,
                             })
                             .is_err()
@@ -437,6 +511,42 @@ pub fn run(
                 }
                 Some(ToWorker::Hint { ctx }) => hint = ctx,
                 Some(ToWorker::Cancel { ctx }) => pending.retain(|c| c != &ctx),
+                Some(ToWorker::SetContext { text, gen }) => {
+                    let text = text.filter(|t| !t.trim().is_empty());
+                    if text == w.context_text {
+                        continue;
+                    }
+                    w.context_text = text;
+                    // Queued requests belong to the old generation: answer
+                    // each "not serviced" stamped with it (preserving
+                    // exactly-once) so the adapter drops the replies without
+                    // clearing markers for re-issued requests.
+                    for old in pending.drain(..) {
+                        if tx
+                            .send(FromWorker {
+                                ctx: old,
+                                gen: w.gen,
+                                dist: None,
+                            })
+                            .is_err()
+                        {
+                            break 'main;
+                        }
+                    }
+                    w.gen = gen;
+                    if let Err(e) = w.rebuild_prefix() {
+                        // seq 0 may hold a partially rewritten prefix; the
+                        // flush below still applies, so prediction degrades
+                        // (PPM-heavy) rather than serving stale context.
+                        eprintln!("keyb-lm-llama: context prefix rebuild: {e}");
+                    }
+                    // Every user-text branch shares prefix cells with seq 0
+                    // and every computed distribution was conditioned on the
+                    // old context: both are stale now.
+                    w.branches.retain(|k, _| k.is_empty());
+                    w.free_seqs = (1..w.max_branches as i32 + 1).rev().collect();
+                    w.computed.clear();
+                }
                 None => break,
             }
         }
@@ -455,11 +565,16 @@ pub fn run(
             let reply = match w.compute(&ctx) {
                 Ok(dist) => FromWorker {
                     ctx,
+                    gen: w.gen,
                     dist: Some(dist),
                 },
                 Err(e) => {
                     eprintln!("keyb-lm-llama: {e}");
-                    FromWorker { ctx, dist: None }
+                    FromWorker {
+                        ctx,
+                        gen: w.gen,
+                        dist: None,
+                    }
                 }
             };
             if tx.send(reply).is_err() {
@@ -489,6 +604,7 @@ pub fn run(
                         if tx
                             .send(FromWorker {
                                 ctx: child,
+                                gen: w.gen,
                                 dist: Some(d),
                             })
                             .is_err()

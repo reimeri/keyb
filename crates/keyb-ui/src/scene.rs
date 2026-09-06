@@ -14,10 +14,11 @@ use crate::{ORIGIN_X_FRAC, RIBBON_H};
 
 /// Labels appear once a box is at least this tall (px).
 const LABEL_MIN_PX: f64 = 18.0;
-/// Left edge of ribbon text, after the reset, collapse, and copy controls.
-const RIBBON_TEXT_X: f64 = 128.0;
-/// Smallest canvas width at which the four ribbon controls remain separate.
-pub(crate) const MIN_CANVAS_W: f64 = 154.0;
+/// Left edge of ribbon text, after the reset, collapse, copy, and
+/// context-capture controls.
+const RIBBON_TEXT_X: f64 = 160.0;
+/// Smallest canvas width at which the five ribbon controls remain separate.
+pub(crate) const MIN_CANVAS_W: f64 = 188.0;
 
 /// Hit-testable rectangle (logical px) of the reset button at the ribbon's
 /// top-left. Tapping it returns the engine to its start state (SPEC §7).
@@ -34,6 +35,12 @@ pub fn collapse_button_rect() -> Rect {
 pub fn copy_button_rect() -> Rect {
     Rect::new(82.0, 12.0, 110.0, 40.0)
 }
+/// Hit-testable rectangle of the context-capture button beside copy. Tapping
+/// it takes the primary selection (clipboard as fallback) as the LLM's
+/// auxiliary context block and shows a preview for verification (SPEC §6.8).
+pub fn capture_button_rect() -> Rect {
+    Rect::new(116.0, 12.0, 144.0, 40.0)
+}
 /// Hit-testable rectangle of the close button at the ribbon's top-right.
 /// Tapping it quits keyb completely.
 pub fn close_button_rect(lw: f64) -> Rect {
@@ -45,6 +52,7 @@ pub(crate) enum RibbonControl {
     Reset,
     Collapse,
     Copy,
+    CaptureContext,
     Close,
 }
 
@@ -57,6 +65,8 @@ pub(crate) fn ribbon_control_at(lw: f64, point: Point) -> Option<RibbonControl> 
         Some(RibbonControl::Collapse)
     } else if copy_button_rect().contains(point) {
         Some(RibbonControl::Copy)
+    } else if capture_button_rect().contains(point) {
+        Some(RibbonControl::CaptureContext)
     } else if close_button_rect(lw).contains(point) {
         Some(RibbonControl::Close)
     } else {
@@ -95,6 +105,29 @@ struct BoxDraw {
     x0: f64,
 }
 
+/// Context-block UI handed to `build` each frame (SPEC §6.8): the chip while
+/// a block is active, and the verification panel while it should be visible.
+pub(crate) struct CtxView<'a> {
+    /// Character count for the `ctx N` chip; `None` hides it.
+    pub chip: Option<usize>,
+    pub panel: Option<PanelView<'a>>,
+}
+
+pub(crate) struct PanelView<'a> {
+    /// Header line, e.g. "context — 742 chars".
+    pub title: String,
+    /// The captured text (post byte-cap — what the model was promised), or
+    /// the failure detail for an error panel.
+    pub body: &'a str,
+    pub error: bool,
+}
+
+/// Whether `point` hits the ctx chip drawn from the last frame's cache.
+/// Left-click re-opens the preview; right-click clears the block.
+pub(crate) fn context_chip_hit(ribbon: &RibbonCache, point: Point) -> bool {
+    ribbon.chip_rect.is_some_and(|r| r.contains(point))
+}
+
 #[derive(Default)]
 pub(crate) struct RibbonCache {
     committed: String,
@@ -102,6 +135,67 @@ pub(crate) struct RibbonCache {
     committed_advance: f32,
     pending: String,
     pending_glyphs: Vec<Glyph>,
+    /// Hit rect of the ctx chip, refreshed every frame (`None` = no chip).
+    chip_rect: Option<Rect>,
+    /// Sanitized + wrapped panel lines, keyed by inputs so an open panel
+    /// costs nothing per frame.
+    panel_key: (String, usize, usize),
+    panel_lines: Vec<String>,
+    /// has_glyph answers mean font parses; memoize per character.
+    glyph_cache: HashMap<char, bool>,
+}
+
+/// Characters the preview can show: newline splits lines, other control
+/// chars become spaces, and anything the system font cannot render becomes
+/// the replacement char (the model still receives the true bytes).
+fn sanitize_panel_text(text: &str, mut has_glyph: impl FnMut(char) -> bool) -> String {
+    text.chars()
+        .map(|c| {
+            if c == '\n' {
+                '\n'
+            } else if c.is_control() {
+                ' '
+            } else if has_glyph(c) {
+                c
+            } else {
+                '\u{FFFD}'
+            }
+        })
+        .collect()
+}
+
+/// Naive fixed-column wrap, then head+tail elision past `max_lines`. This is
+/// a verification panel, not typesetting: mid-word breaks are fine.
+fn wrap_panel_text(text: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let max_lines = max_lines.max(2);
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let mut rest = raw;
+        loop {
+            match rest.char_indices().nth(max_chars) {
+                Some((cut, _)) => {
+                    lines.push(rest[..cut].to_string());
+                    rest = &rest[cut..];
+                }
+                None => {
+                    lines.push(rest.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if lines.len() > max_lines {
+        let head = max_lines * 2 / 3;
+        let tail = max_lines - head - 1;
+        let elided = lines.len() - head - tail;
+        let mut out: Vec<String> = lines[..head].to_vec();
+        out.push(format!("\u{2026} ({elided} lines elided) \u{2026}"));
+        out.extend_from_slice(&lines[lines.len() - tail..]);
+        out
+    } else {
+        lines
+    }
 }
 
 /// Left edge (`x0`, logical px) for each box, widened bottom-up so a box's
@@ -139,6 +233,7 @@ fn box_left_edges(boxes: &[(usize, usize, f64, f64, bool)], lw: f64) -> Vec<f64>
     x0s
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     scene: &mut Scene,
     ribbon: &mut RibbonCache,
@@ -147,6 +242,7 @@ pub fn build(
     viewport: (f64, f64, f64),
     input: PointerInput,
     cursor: (f64, f64),
+    ctx_view: CtxView<'_>,
 ) {
     let (lw, lh, scale) = viewport;
     // Everything is laid out in logical px, then scaled once to physical.
@@ -439,6 +535,35 @@ pub fn build(
         &front_page,
     );
 
+    // Context-capture button beside copy: ⧉ ("take the selection as
+    // context"), with an ASCII stand-in where the system font lacks it.
+    let btn = capture_button_rect();
+    scene.fill(
+        Fill::NonZero,
+        t,
+        Color::from_rgba8(0xFF, 0xFF, 0xFF, 24),
+        None,
+        &RoundedRect::from_rect(btn, 6.0),
+    );
+    let cap_px = (btn.height() * 0.72) as f32;
+    let cap_label = if fonts.has_glyph('\u{29C9}') {
+        "\u{29C9}"
+    } else {
+        "T"
+    };
+    let (glyphs, adv) = fonts.layout(cap_label, cap_px);
+    scene
+        .draw_glyphs(&fonts.font)
+        .font_size(cap_px)
+        .transform(
+            t * Affine::translate((
+                btn.center().x - adv as f64 / 2.0,
+                btn.center().y + cap_px as f64 * 0.35,
+            )),
+        )
+        .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
+        .draw(Fill::NonZero, glyphs.into_iter());
+
     // Close button at top-right. Unlike collapse, this exits keyb and removes
     // its native surface completely.
     let btn = close_button_rect(lw);
@@ -462,6 +587,108 @@ pub fn build(
         )
         .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
         .draw(Fill::NonZero, glyphs.into_iter());
+
+    // Context chip (SPEC §6.8): while a captured block is active, show its
+    // size left of Close — lit while the preview panel is up. The rect is
+    // cached so the frontends can hit-test clicks (left: pin the preview
+    // open, right: clear the block).
+    ribbon.chip_rect = None;
+    if let Some(chars) = ctx_view.chip {
+        let chip_px = 15.0f32;
+        let label = format!("ctx {chars}");
+        let (glyphs, adv) = fonts.layout(&label, chip_px);
+        let w = adv as f64 + 16.0;
+        let x1 = close_button_rect(lw).x0 - 8.0;
+        let rect = Rect::new(x1 - w, 12.0, x1, 40.0);
+        ribbon.chip_rect = Some(rect);
+        let lit = ctx_view.panel.is_some();
+        scene.fill(
+            Fill::NonZero,
+            t,
+            Color::from_rgba8(0x7A, 0xA2, 0xF7, if lit { 110 } else { 40 }),
+            None,
+            &RoundedRect::from_rect(rect, 6.0),
+        );
+        scene
+            .draw_glyphs(&fonts.font)
+            .font_size(chip_px)
+            .transform(
+                t * Affine::translate((rect.x0 + 8.0, rect.center().y + chip_px as f64 * 0.35)),
+            )
+            .brush(Color::from_rgb8(0xD8, 0xDC, 0xE8))
+            .draw(Fill::NonZero, glyphs.into_iter());
+    }
+
+    // Context preview panel (SPEC §6.8): the captured text, exactly as
+    // promised to the model (post byte-cap), so the user can verify what
+    // they are feeding it. Overlays the canvas but is never hit-testable —
+    // steering clicks pass straight through to the engine.
+    if let Some(panel) = &ctx_view.panel {
+        let panel_px = 14.0f32;
+        let line_h = 18.0f64;
+        let x0 = 8.0;
+        let x1 = lw - 8.0;
+        let inner_w = (x1 - x0 - 24.0).max(40.0);
+        let max_chars = (inner_w / (panel_px as f64 * 0.58)).max(8.0) as usize;
+        let avail_h = (lh * 0.65 - RIBBON_H - 16.0).max(80.0);
+        let max_lines = ((avail_h - 34.0) / line_h).clamp(4.0, 24.0) as usize;
+
+        let key = (panel.body.to_string(), max_chars, max_lines);
+        if ribbon.panel_key != key {
+            let sanitized = sanitize_panel_text(panel.body, |c| {
+                *ribbon
+                    .glyph_cache
+                    .entry(c)
+                    .or_insert_with(|| fonts.has_glyph(c))
+            });
+            ribbon.panel_lines = wrap_panel_text(&sanitized, max_chars, max_lines);
+            ribbon.panel_key = key;
+        }
+
+        let panel_top = RIBBON_H + 8.0;
+        let panel_h = 10.0 + 20.0 + ribbon.panel_lines.len() as f64 * line_h + 10.0;
+        let rect = RoundedRect::new(x0, panel_top, x1, panel_top + panel_h, 8.0);
+        let (fill, edge) = if panel.error {
+            (
+                Color::from_rgba8(0x2B, 0x14, 0x14, 242),
+                Color::from_rgba8(0xFF, 0x60, 0x60, 120),
+            )
+        } else {
+            (
+                Color::from_rgba8(0x0C, 0x0D, 0x14, 242),
+                Color::from_rgba8(0xFF, 0xFF, 0xFF, 40),
+            )
+        };
+        scene.fill(Fill::NonZero, t, fill, None, &rect);
+        scene.stroke(&Stroke::new(1.0), t, edge, None, &rect);
+
+        let (title_glyphs, _) = fonts.layout(&panel.title, panel_px);
+        scene
+            .draw_glyphs(&fonts.font)
+            .font_size(panel_px)
+            .transform(t * Affine::translate((x0 + 12.0, panel_top + 24.0)))
+            .brush(if panel.error {
+                Color::from_rgb8(0xFF, 0x90, 0x90)
+            } else {
+                Color::from_rgb8(0x7A, 0xA2, 0xF7)
+            })
+            .draw(Fill::NonZero, title_glyphs.into_iter());
+
+        for (row, line) in ribbon.panel_lines.iter().enumerate() {
+            let (glyphs, _) = fonts.layout(line, panel_px);
+            scene
+                .draw_glyphs(&fonts.font)
+                .font_size(panel_px)
+                .transform(
+                    t * Affine::translate((
+                        x0 + 12.0,
+                        panel_top + 24.0 + 20.0 + row as f64 * line_h + panel_px as f64 * 0.35,
+                    )),
+                )
+                .brush(Color::from_rgb8(0xB8, 0xBC, 0xC8))
+                .draw(Fill::NonZero, glyphs.into_iter());
+        }
+    }
 
     // Speed readout, bottom-left.
     let (glyphs, _) = fonts.layout(
@@ -579,9 +806,10 @@ fn hsl(h: f64, s: f64, l: f64) -> Color {
 #[cfg(test)]
 mod tests {
     use super::{
-        box_left_edges, close_button_rect, collapse_button_rect, copy_button_rect,
-        reset_button_rect, ribbon_control_at, ribbon_text_rect, RibbonControl, LABEL_PAD,
-        MIN_CANVAS_W, RIBBON_TEXT_X,
+        box_left_edges, capture_button_rect, close_button_rect, collapse_button_rect,
+        context_chip_hit, copy_button_rect, reset_button_rect, ribbon_control_at, ribbon_text_rect,
+        sanitize_panel_text, wrap_panel_text, RibbonCache, RibbonControl, LABEL_PAD, MIN_CANVAS_W,
+        RIBBON_TEXT_X,
     };
     use crate::RIBBON_H;
     use vello::kurbo::Point;
@@ -594,8 +822,9 @@ mod tests {
             let reset = reset_button_rect();
             let collapse = collapse_button_rect();
             let copy = copy_button_rect();
+            let capture = capture_button_rect();
             let close = close_button_rect(lw);
-            for button in [reset, collapse, copy, close] {
+            for button in [reset, collapse, copy, capture, close] {
                 assert!(button.x0 >= 0.0 && button.x1 <= lw, "within canvas width");
                 assert!(
                     button.y0 >= 0.0 && button.y1 <= RIBBON_H,
@@ -604,12 +833,13 @@ mod tests {
             }
             assert!(reset.x1 < collapse.x0, "left controls do not overlap");
             assert!(collapse.x1 < copy.x0, "copy is separate from collapse");
-            assert!(copy.x1 < close.x0, "close is separate on the right");
+            assert!(copy.x1 < capture.x0, "capture is separate from copy");
+            assert!(capture.x1 < close.x0, "close is separate on the right");
             assert!(reset.x0 < lw * 0.2, "reset is anchored to the left");
             assert!(close.x1 > lw * 0.8, "close is anchored to the right");
         }
         assert!(
-            copy_button_rect().x1 < RIBBON_TEXT_X,
+            capture_button_rect().x1 < RIBBON_TEXT_X,
             "left controls do not overlap ribbon text"
         );
         assert!(
@@ -624,6 +854,7 @@ mod tests {
             (reset_button_rect(), RibbonControl::Reset),
             (collapse_button_rect(), RibbonControl::Collapse),
             (copy_button_rect(), RibbonControl::Copy),
+            (capture_button_rect(), RibbonControl::CaptureContext),
             (close_button_rect(MIN_CANVAS_W), RibbonControl::Close),
         ] {
             assert_eq!(
@@ -674,6 +905,44 @@ mod tests {
             (x0[0] - (LW - 200.0 * 1.1)).abs() < 1e-6,
             "parent stays nominal"
         );
+    }
+
+    #[test]
+    fn chip_hit_testing_follows_cached_rect() {
+        let mut ribbon = RibbonCache::default();
+        assert!(!context_chip_hit(&ribbon, Point::new(500.0, 26.0)));
+        ribbon.chip_rect = Some(vello::kurbo::Rect::new(480.0, 12.0, 520.0, 40.0));
+        assert!(context_chip_hit(&ribbon, Point::new(500.0, 26.0)));
+        assert!(!context_chip_hit(&ribbon, Point::new(500.0, 50.0)));
+        assert!(!context_chip_hit(&ribbon, Point::new(100.0, 26.0)));
+    }
+
+    #[test]
+    fn panel_sanitization_keeps_only_renderable_text() {
+        // Stub font: ASCII letters and space only.
+        let has = |c: char| c.is_ascii_lowercase() || c == ' ';
+        let out = sanitize_panel_text("hi\tthere\n\u{1F600}x\u{7F}", has);
+        assert_eq!(out, "hi there\n\u{FFFD}x ");
+    }
+
+    #[test]
+    fn panel_wrap_breaks_long_lines_and_keeps_empty_ones() {
+        let lines = wrap_panel_text("abcdef\n\ngh", 3, 10);
+        assert_eq!(lines, vec!["abc", "def", "", "gh"]);
+    }
+
+    #[test]
+    fn panel_wrap_elides_the_middle_of_long_captures() {
+        let text: String = (0..30).map(|i| format!("line {i:02}\n")).collect();
+        let lines = wrap_panel_text(&text, 80, 9);
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[0], "line 00");
+        assert!(
+            lines[6].contains("lines elided"),
+            "elision marker: {:?}",
+            lines[6]
+        );
+        assert_eq!(lines[8], "line 29", "tail survives: {lines:?}");
     }
 
     /// Left edges never cross the canvas cap even for a deep near-full chain.

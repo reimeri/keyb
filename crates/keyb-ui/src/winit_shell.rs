@@ -17,7 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::scene::{ribbon_control_at, RibbonControl, MIN_CANVAS_W};
+use crate::scene::{context_chip_hit, ribbon_control_at, RibbonControl, MIN_CANVAS_W};
 use crate::{osk_width, Core, Gpu, RIBBON_H};
 
 struct RenderState {
@@ -97,6 +97,8 @@ impl App {
         let (cx, cy) = self.core.cursor;
         if !self.core.visible {
             self.core.visible = true;
+        } else if context_chip_hit(&self.core.ribbon, vello::kurbo::Point::new(cx, cy)) {
+            self.core.toggle_context_preview();
         } else {
             match ribbon_control_at(lw, vello::kurbo::Point::new(cx, cy)) {
                 Some(RibbonControl::Collapse) => {
@@ -110,12 +112,25 @@ impl App {
                         eprintln!("keyb: could not copy text: {error:#}");
                     }
                 }
+                Some(RibbonControl::CaptureContext) => {
+                    self.core.engaged = false;
+                    self.core.capture_context();
+                }
                 Some(RibbonControl::Close) => {
                     self.core.engaged = false;
                     event_loop.exit();
                 }
                 None => self.core.engaged = true,
             }
+        }
+    }
+
+    /// Right-button press: clears the context block when the ctx chip is hit
+    /// (SPEC §6.8); anywhere else it does nothing.
+    fn right_press(&mut self) {
+        let (cx, cy) = self.core.cursor;
+        if context_chip_hit(&self.core.ribbon, vello::kurbo::Point::new(cx, cy)) {
+            self.core.clear_context();
         }
     }
 
@@ -200,15 +215,17 @@ impl ApplicationHandler for App {
                 // would otherwise stay engaged forever.
                 self.core.engaged = false;
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => {
                     if state == ElementState::Pressed {
                         self.press(event_loop);
                     } else {
                         self.core.engaged = false;
                     }
                 }
-            }
+                MouseButton::Right if state == ElementState::Pressed => self.right_press(),
+                _ => {}
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
@@ -287,8 +304,8 @@ mod tests {
 
     #[test]
     fn osk_width_preserves_distinct_toolbar_controls() {
-        assert_eq!(clamp_osk_width(100, 1920, 1.0), 154);
-        assert_eq!(clamp_osk_width(100, 3840, 2.0), 308);
+        assert_eq!(clamp_osk_width(100, 1920, 1.0), 188);
+        assert_eq!(clamp_osk_width(100, 3840, 2.0), 376);
         assert_eq!(clamp_osk_width(100, 80, 1.0), 80);
     }
 }

@@ -115,3 +115,55 @@ fn request_to_upgrade_latency_within_budget() {
     // SPEC §10: ≤ 80 ms p95 on the target machine; allow CI slack ×2.
     assert!(p95 < 160.0, "p95 latency {p95:.1} ms exceeds budget");
 }
+
+/// SPEC §6.8: a captured block must move the empty-context distribution, a
+/// tail-trimmed over-budget block must still upgrade, and clearing restores
+/// preamble-only conditioning.
+#[test]
+fn context_block_reaches_the_model_and_clears() {
+    let Some((mut lm, alphabet)) = lm_or_skip() else {
+        return;
+    };
+    let without = upgraded(&mut lm, b"", Duration::from_secs(10));
+    lm.set_context(Some(
+        "alice: are you coming to the meeting on thursday?\n\
+         bob: yes, the council will discuss the housing proposal there\n\
+         alice:",
+    ));
+    let with = upgraded(&mut lm, b"", Duration::from_secs(15));
+    let tv = 0.5
+        * without
+            .iter()
+            .zip(&with)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f64>();
+    eprintln!("context total-variation distance: {tv:.3}");
+    assert!(
+        tv > 0.01,
+        "context block must change predictions measurably (tv={tv:.4})"
+    );
+
+    // Over the worker's token budget: tail-trim rather than fail. Prefix
+    // rebuild of ~1k tokens is slower than a short block.
+    let long = "the council will meet on thursday.\n".repeat(200);
+    lm.set_context(Some(&long));
+    let dist = upgraded(&mut lm, b"", Duration::from_secs(60));
+    assert_eq!(dist.len(), alphabet.len());
+    let sum: f64 = dist.iter().sum();
+    assert!((sum - 1.0).abs() < 1e-9, "over-budget block: sum={sum}");
+    assert!(dist.iter().all(|&p| p > 0.0));
+
+    lm.set_context(None);
+    let cleared = upgraded(&mut lm, b"", Duration::from_secs(15));
+    let tv_clear = 0.5
+        * without
+            .iter()
+            .zip(&cleared)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f64>();
+    eprintln!("cleared vs original total-variation: {tv_clear:.4}");
+    assert!(
+        tv_clear < 0.01,
+        "clearing must restore preamble-only conditioning (tv={tv_clear:.4})"
+    );
+}

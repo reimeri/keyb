@@ -86,11 +86,18 @@ Steering:
 - **Vertical position** selects which box you drift toward.
 - Scroll wheel or `+`/`-` adjusts speed; `Esc` quits. In the ribbon, **↺** resets
   the current context, **›** collapses to the edge handle, **⎘** copies all
-  finalized text to the clipboard, and **×** quits keyb completely.
+  finalized text to the clipboard, **⧉** captures the primary selection
+  (clipboard as fallback) as prediction context, and **×** quits keyb
+  completely. While a context block is active a `ctx N` chip appears: left-click
+  pins or dismisses the preview, right-click drops the block without resetting
+  typed text.
 
 Typed words are learned into a decaying personal vocabulary at
 `$XDG_DATA_HOME/keyb/user_model.v1.bin` (or
-`$HOME/.local/share/keyb/user_model.v1.bin` when unset).
+`$HOME/.local/share/keyb/user_model.v1.bin` when unset). The last captured
+context block is also dumped to `$XDG_STATE_HOME/keyb/last_context.txt` (or
+`$HOME/.local/state/keyb/last_context.txt`) so you can check exactly what the
+model was promised.
 
 ## Environment variables
 

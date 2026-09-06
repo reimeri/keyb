@@ -637,6 +637,10 @@ impl LanguageModel for Personalized {
         self.inner.frame_hint(center_context);
     }
 
+    fn set_context(&mut self, context: Option<&str>) {
+        self.inner.set_context(context);
+    }
+
     fn release(&mut self, context: &[u8]) {
         self.inner.release(context);
     }
@@ -660,6 +664,7 @@ impl Drop for Personalized {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keyb_core::LanguageModel;
 
     const N: usize = 30;
     const HL: u64 = DEFAULT_HALF_LIFE_SECS;
@@ -691,7 +696,7 @@ mod tests {
         m.learn(b"q", 5, 0);
         let (_p0, w0) = m.predict(b"q", 0);
         let (_p1, w1) = m.predict(b"q", HL); // one half-life later
-        // Weight = e/(e+K); with e halved from 1.0 to 0.5 it must drop.
+                                             // Weight = e/(e+K); with e halved from 1.0 to 0.5 it must drop.
         assert!(w1 < w0, "evidence weight must fall after a half-life");
         // Effective evidence at t=HL is ~0.5, so weight ~ 0.5/4.5.
         assert!((w1 - (0.5 / (0.5 + WEIGHT_K))).abs() < 1e-6);
@@ -746,6 +751,44 @@ mod tests {
 
     fn personalized(path: &Path) -> Personalized {
         Personalized::load_or_new(N, Box::new(crate::PpmModel::new(N, 4)), path.to_path_buf())
+    }
+
+    #[test]
+    fn set_context_forwards_to_inner() {
+        struct Inner {
+            n: usize,
+            set: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        }
+        impl LanguageModel for Inner {
+            fn predict(&mut self, _context: &[u8]) -> Vec<f64> {
+                vec![1.0 / self.n as f64; self.n]
+            }
+            fn set_context(&mut self, context: Option<&str>) {
+                self.set.lock().unwrap().push(context.map(str::to_string));
+            }
+            fn alphabet_len(&self) -> usize {
+                self.n
+            }
+        }
+        let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let path = scratch("ctx-forward");
+        let mut p = Personalized::load_or_new(
+            N,
+            Box::new(Inner {
+                n: N,
+                set: set.clone(),
+            }),
+            path.clone(),
+        );
+        p.set_context(Some("reply to this"));
+        p.set_context(None);
+        assert_eq!(
+            set.lock().unwrap().as_slice(),
+            &[Some("reply to this".to_string()), None],
+            "Personalized must not swallow auxiliary context"
+        );
+        drop(p);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// `note_commit` runs on the render thread inside `Engine::step`, so the
