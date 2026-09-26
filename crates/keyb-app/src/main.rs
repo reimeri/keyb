@@ -79,22 +79,27 @@ fn injection_worker(
             let mut ledger = RetractionLedger::default();
             for ev in rx {
                 let r = match &ev {
-                    TextEvent::Commit(text) => {
-                        ledger.push(text);
-                        injector.commit(text)
-                    }
+                    TextEvent::Commit(text) => injector.commit(text).map(|()| ledger.push(text)),
                     // Only retract text the ledger still tracks (SPEC §8.3);
                     // anything older stays put in the target app.
                     TextEvent::Retract(text) => {
-                        if ledger.take(text) {
-                            injector.retract(text)
+                        if ledger.can_take(text) {
+                            injector.retract(text).map(|()| {
+                                let taken = ledger.take(text);
+                                debug_assert!(taken);
+                            })
                         } else {
                             Ok(())
                         }
                     }
                 };
                 if let Err(e) = r {
-                    eprintln!("keyb: injection failed: {e:#}");
+                    // The backend may have performed part of a multi-character
+                    // operation before returning an error. Its Result cannot
+                    // describe partial progress, so the target is uncertain.
+                    eprintln!(
+                        "keyb: injection failed (target text may be partially changed): {e:#}"
+                    );
                 }
             }
         })
@@ -177,5 +182,99 @@ mod tests {
         let (cfg, managed) = configured_model(None);
         assert_eq!(cfg.model_path, keyb_lm_llama::default_model_path());
         assert!(managed);
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use anyhow::anyhow;
+    use keyb_inject::Caps;
+    use std::sync::{Arc, Mutex};
+
+    struct ScriptedInjector {
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_commit: bool,
+        fail_retract_once: bool,
+    }
+
+    impl Injector for ScriptedInjector {
+        fn commit(&mut self, text: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("commit:{text}"));
+            if self.fail_commit {
+                Err(anyhow!("commit failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn retract(&mut self, text: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("retract:{text}"));
+            if self.fail_retract_once {
+                self.fail_retract_once = false;
+                Err(anyhow!("retract failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn capabilities(&self) -> Caps {
+            Caps {
+                name: "scripted",
+                true_retraction: true,
+            }
+        }
+    }
+
+    fn run_events(
+        events: Vec<TextEvent>,
+        fail_commit: bool,
+        fail_retract_once: bool,
+    ) -> Vec<String> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _, worker) = injection_worker(Box::new(ScriptedInjector {
+            calls: Arc::clone(&calls),
+            fail_commit,
+            fail_retract_once,
+        }));
+        for event in events {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+        worker.join().unwrap();
+        let result = calls.lock().unwrap().clone();
+        result
+    }
+
+    #[test]
+    fn failed_commit_is_not_retractable() {
+        assert_eq!(
+            run_events(
+                vec![
+                    TextEvent::Commit("ab".into()),
+                    TextEvent::Retract("ab".into())
+                ],
+                true,
+                false
+            ),
+            vec!["commit:ab"]
+        );
+    }
+
+    #[test]
+    fn failed_retract_preserves_suffix_until_successful_retry() {
+        assert_eq!(
+            run_events(
+                vec![
+                    TextEvent::Commit("ab".into()),
+                    TextEvent::Retract("ab".into()),
+                    TextEvent::Retract("ab".into()),
+                    TextEvent::Retract("ab".into())
+                ],
+                false,
+                true,
+            ),
+            vec!["commit:ab", "retract:ab", "retract:ab"]
+        );
     }
 }

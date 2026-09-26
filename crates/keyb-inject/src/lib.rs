@@ -68,27 +68,24 @@ impl RetractionLedger {
         }
     }
 
+    /// Whether `text` is the entire tracked suffix, without consuming it.
+    /// Check before touching an injection backend; only take after it succeeds.
+    pub fn can_take(&self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let mut have = self.chunks.iter().rev().flat_map(|c| c.chars().rev());
+        text.chars().rev().all(|want| have.next() == Some(want))
+    }
+
     /// Try to take `text` off the tail. True means the ledger tracked it and
     /// the caller should retract it from the target; false means it fell off
     /// the rolling window (or never matched) and must be left alone.
     pub fn take(&mut self, text: &str) -> bool {
-        let mut need: Vec<char> = text.chars().collect();
-        // Verify the whole suffix matches before mutating anything.
-        {
-            let mut have = self
-                .chunks
-                .iter()
-                .rev()
-                .flat_map(|c| c.chars().rev())
-                .take(need.len());
-            let mut want = need.iter().rev();
-            for w in want.by_ref() {
-                match have.next() {
-                    Some(h) if h == *w => {}
-                    _ => return false,
-                }
-            }
+        if !self.can_take(text) {
+            return false;
         }
+        let mut need: Vec<char> = text.chars().collect();
         while let Some(mut last) = self.chunks.pop_back() {
             while !need.is_empty() {
                 match last.pop() {
@@ -236,6 +233,20 @@ mod tests {
         assert!(!l.take("x"), "mismatched suffix refused");
         assert!(l.take("bc"), "tracked suffix accepted");
         assert!(!l.take("a"), "beyond the window refused");
+    }
+
+    #[test]
+    fn ledger_suffix_probe_does_not_consume_text() {
+        let mut l = RetractionLedger::new(32);
+        l.push("th");
+        l.push("é");
+        assert!(!l.can_take("xé"));
+        assert!(!l.can_take(""));
+        assert!(l.can_take("hé"));
+        assert!(l.can_take("hé"));
+        assert!(l.take("hé"));
+        assert!(l.take("t"));
+        assert!(l.is_empty());
     }
 
     #[test]

@@ -67,6 +67,21 @@ pub struct FromWorker {
     pub dist: Option<Vec<f64>>,
 }
 
+/// A skipped rebuild still has to adopt the adapter's generation: it may
+/// have advanced through context changes that were shed before reaching us.
+fn same_context_adopt_generation(
+    current: &Option<String>,
+    current_gen: &mut u64,
+    text: &Option<String>,
+    gen: u64,
+) -> bool {
+    if current != text {
+        return false;
+    }
+    *current_gen = gen;
+    true
+}
+
 /// How much of the healed token mass may end exactly at the current prefix
 /// before we pay one extra forward pass to resolve its continuation (§6.2).
 const EXACT_MASS_THRESHOLD: f64 = 0.05;
@@ -513,7 +528,7 @@ pub fn run(
                 Some(ToWorker::Cancel { ctx }) => pending.retain(|c| c != &ctx),
                 Some(ToWorker::SetContext { text, gen }) => {
                     let text = text.filter(|t| !t.trim().is_empty());
-                    if text == w.context_text {
+                    if same_context_adopt_generation(&w.context_text, &mut w.gen, &text, gen) {
                         continue;
                     }
                     w.context_text = text;
@@ -619,5 +634,42 @@ pub fn run(
             }
             cur.push(order[0] as u8);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_context_adopt_generation;
+
+    #[test]
+    fn unchanged_context_adopts_new_generation_without_rebuild() {
+        let current = Some("context A".to_owned());
+        let mut gen = 1;
+        // Context B was shed: the worker still has A when the adapter
+        // switches back to A in generation 3.
+        assert!(same_context_adopt_generation(
+            &current,
+            &mut gen,
+            &Some("context A".to_owned()),
+            3
+        ));
+        assert_eq!(gen, 3);
+        assert!(!same_context_adopt_generation(
+            &current,
+            &mut gen,
+            &Some("context B".to_owned()),
+            4
+        ));
+        assert_eq!(
+            gen, 3,
+            "changed text must stamp pending replies with the old generation"
+        );
+    }
+
+    #[test]
+    fn unchanged_empty_context_adopts_new_generation() {
+        let mut gen = 0;
+        assert!(same_context_adopt_generation(&None, &mut gen, &None, 2));
+        assert_eq!(gen, 2);
     }
 }

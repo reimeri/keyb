@@ -18,7 +18,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::scene::{context_chip_hit, ribbon_control_at, RibbonControl, MIN_CANVAS_W};
-use crate::{osk_width, Core, Gpu, RIBBON_H};
+use crate::{osk_width, Core, Gpu, HANDLE_H, HANDLE_W, RIBBON_H};
 
 struct RenderState {
     surface: vello::util::RenderSurface<'static>,
@@ -30,14 +30,40 @@ fn clamp_osk_width(width: u32, monitor_width: u32, scale: f64) -> u32 {
     width.clamp(min_width, monitor_width)
 }
 
+/// Physical X11 window bounds for the logical-size handle, anchored at the
+/// right edge of the expanded column, centered vertically like the layer shell.
+/// Nonzero monitor origins are preserved.
+fn handle_geometry(
+    pos: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    scale: f64,
+) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let desired: PhysicalSize<u32> =
+        LogicalSize::new(HANDLE_W as f64, HANDLE_H as f64).to_physical(scale);
+    let handle = PhysicalSize::new(
+        desired.width.min(size.width),
+        desired.height.min(size.height),
+    );
+    (
+        PhysicalPosition::new(
+            pos.x.saturating_add((size.width - handle.width) as i32),
+            pos.y
+                .saturating_add(((size.height - handle.height) / 2) as i32),
+        ),
+        handle,
+    )
+}
+
 struct App {
     core: Core,
     gpu: Gpu,
     state: Option<RenderState>,
     error: Option<anyhow::Error>,
-    /// Borderless bottom-anchored override-redirect strip instead of a
+    /// Borderless right-edge override-redirect strip instead of a
     /// normal window.
     osk: bool,
+    /// Expanded bounds saved before shrinking the X11 dock to its handle.
+    expanded_bounds: Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>,
 }
 
 impl App {
@@ -88,6 +114,37 @@ impl App {
         event_loop.exit();
     }
 
+    fn set_visible(&mut self, visible: bool) {
+        if self.core.visible == visible {
+            return;
+        }
+        if self.osk {
+            let Some(state) = &self.state else { return };
+            if visible {
+                if let Some((pos, size)) = self.expanded_bounds.take() {
+                    state.window.set_outer_position(pos);
+                    let _ = state.window.request_inner_size(size);
+                }
+            } else {
+                let pos = match state.window.outer_position() {
+                    Ok(pos) => pos,
+                    Err(error) => {
+                        eprintln!("keyb: could not read X11 OSK position: {error}");
+                        return;
+                    }
+                };
+                let size = state.window.inner_size();
+                let (handle_pos, handle_size) =
+                    handle_geometry(pos, size, state.window.scale_factor());
+                self.expanded_bounds = Some((pos, size));
+                let _ = state.window.request_inner_size(handle_size);
+                state.window.set_outer_position(handle_pos);
+            }
+        }
+        self.core.visible = visible;
+        self.core.engaged = false;
+    }
+
     /// Left-button press: activate a ribbon control / edge handle, otherwise
     /// engage steering (mirrors the layer-shell frontend).
     fn press(&mut self, event_loop: &ActiveEventLoop) {
@@ -96,15 +153,12 @@ impl App {
         let lw = state.window.inner_size().width as f64 / scale;
         let (cx, cy) = self.core.cursor;
         if !self.core.visible {
-            self.core.visible = true;
+            self.set_visible(true);
         } else if context_chip_hit(&self.core.ribbon, vello::kurbo::Point::new(cx, cy)) {
             self.core.toggle_context_preview();
         } else {
             match ribbon_control_at(lw, vello::kurbo::Point::new(cx, cy)) {
-                Some(RibbonControl::Collapse) => {
-                    self.core.visible = false;
-                    self.core.engaged = false;
-                }
+                Some(RibbonControl::Collapse) => self.set_visible(false),
                 Some(RibbonControl::Reset) => self.core.reset(),
                 Some(RibbonControl::Copy) => {
                     self.core.engaged = false;
@@ -290,6 +344,7 @@ pub fn run(core: Core, osk: bool) -> Result<()> {
         state: None,
         error: None,
         osk,
+        expanded_bounds: None,
     };
     event_loop.run_app(&mut app)?;
     match app.error {
@@ -300,12 +355,45 @@ pub fn run(core: Core, osk: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_osk_width;
+    use super::{clamp_osk_width, handle_geometry};
+    use winit::dpi::{PhysicalPosition, PhysicalSize};
 
     #[test]
     fn osk_width_preserves_distinct_toolbar_controls() {
         assert_eq!(clamp_osk_width(100, 1920, 1.0), 188);
         assert_eq!(clamp_osk_width(100, 3840, 2.0), 376);
         assert_eq!(clamp_osk_width(100, 80, 1.0), 80);
+    }
+
+    #[test]
+    fn handle_is_scaled_and_right_edge_centered() {
+        assert_eq!(
+            handle_geometry(
+                PhysicalPosition::new(100, 50),
+                PhysicalSize::new(400, 1000),
+                1.0
+            ),
+            (PhysicalPosition::new(472, 495), PhysicalSize::new(28, 110))
+        );
+        assert_eq!(
+            handle_geometry(
+                PhysicalPosition::new(-1500, -300),
+                PhysicalSize::new(600, 900),
+                2.0
+            ),
+            (PhysicalPosition::new(-956, 40), PhysicalSize::new(56, 220))
+        );
+    }
+
+    #[test]
+    fn handle_never_extends_past_small_window() {
+        assert_eq!(
+            handle_geometry(
+                PhysicalPosition::new(10, 20),
+                PhysicalSize::new(20, 80),
+                1.0
+            ),
+            (PhysicalPosition::new(10, 20), PhysicalSize::new(20, 80))
+        );
     }
 }
