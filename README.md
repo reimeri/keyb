@@ -46,11 +46,23 @@ nix run              # run the packaged binary
 nix build            # ./result/bin/keyb
 ```
 
-Add this repo as a flake input, then install the package:
+Add this repo as an input to your NixOS flake and make keyb follow your own
+`nixpkgs` input:
 
 ```nix
-inputs.keyb.url = "github:reimeri/keyb";
+inputs.keyb = {
+  url = "github:reimeri/keyb";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
 ```
+
+This uses the same nixpkgs revision as your system, keeping keyb's runtime
+libraries compatible with the system graphics drivers. Using keyb's separate
+nixpkgs pin can cause glibc version mismatches that prevent EGL or Vulkan drivers
+from loading, resulting in startup failures such as "Couldn't find suitable
+device".
+
+Then install the package:
 
 ```nix
 environment.systemPackages = [ inputs.keyb.packages.${pkgs.system}.default ];
