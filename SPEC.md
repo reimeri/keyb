@@ -58,7 +58,7 @@ model (§6.7). It is per-user statistics, not weight updates.
 | Default model | **Qwen2.5-0.5B-Instruct, Q4_K_M GGUF** (~491 MB) | Sub-50 ms per forward pass on a mid-range CPU; far below chat quality bar but far above the entropy bar needed for box sizing. Swappable via `KEYB_MODEL`; any GGUF works. |
 | Fallback char model | Order-4 **PPM** trained on an embedded seed corpus + online commits, in-crate | Smoothing floor and offline/degraded mode; tiny and instant. Also the sole model when no GGUF is available. |
 | Text injection | Wayland `zwp_virtual_keyboard_v1` + `zwp_input_method_v2` (one hybrid backend); X11 XTEST (via `x11rb`); in-process buffer as last resort | See §8. |
-| Config/persistence | Environment variables (§9) + a binary user-vocabulary file under `$XDG_DATA_HOME/keyb/`. **No config file yet** — TOML via `serde` is planned (M4). | |
+| Config/persistence | Environment variables + an editable UTF-8 system prompt under `$XDG_CONFIG_HOME/keyb/` (§9), and a binary user-vocabulary file under `$XDG_DATA_HOME/keyb/`. General-purpose TOML via `serde` is planned (M4). | |
 | Async/threading | std threads + `crossbeam-channel`; **no tokio** | The concurrency shape is a small fixed set of workers with bounded channels; an async runtime adds nothing. |
 
 Threads at runtime: the UI/frame thread, the llama.cpp inference worker
@@ -446,11 +446,16 @@ llama.cpp sequence IDs implement the tree cache, over a unified KV cache of
   evicting the pinned branch or the copy source of the request in flight.
   A failed decode returns its sequence id to the free list, so the branch budget
   cannot leak.
-- Sequence 0 is pinned and holds the **system preamble** — a short instruction
-  priming the model toward ordinary prose with normal capitalization and
-  punctuation. It is warmed at startup so the first prediction is one prefix copy
-  plus a short decode away. Committed text is *not* separately resident; a
-  re-entered branch is recomputed from the preamble plus its token prefix.
+- Sequence 0 is pinned and holds the **system preamble** — the full static
+  prompt loaded from the user's instructions file (§9), followed by any
+  auxiliary context block (§6.8). Its default primes the model toward ordinary
+  prose with normal capitalization and punctuation. No hidden instructions are
+  prepended to the user's prompt. It is warmed at startup so the first
+  prediction is one prefix copy plus a short decode away. Prefix and branch
+  decoding are chunked to llama.cpp's logical batch limit, with absolute token
+  positions and logits requested only for the final token. Committed text is
+  *not* separately resident; a re-entered branch is recomputed from the pinned
+  prefix plus its token prefix.
 - Context window: the worker feeds the model the last `WINDOW` (800) committed
   symbols, with the window start moving in `WINDOW_STEP` (256) jumps so branch
   prefixes stay shareable across jumps.
@@ -528,15 +533,18 @@ markers, and drops worker replies stamped with any other generation. A shed
 `SetContext` is retried from a latest-wins outbox on `poll_upgrades`. Blank or
 unchanged text is a no-op.
 
-The worker tokenizes preamble + header + body + tail separately:
+The worker retains the configured static prompt tokens across context changes
+and tokenizes header + body + tail separately:
 
 - header: `The writer is replying to the following text:\n`
 - tail: `\n\nThe writer's reply:\n`
 - body token budget 1024 (header and tail subtracted), **tail-trimmed**
 
-It then rebuilds sequence 0, answers every queued `Predict` as unserviced under
-the old generation, and flushes user-text KV branches plus computed
-distributions.
+It answers every queued `Predict` as unserviced under the old generation,
+releases all old KV sequences before rebuilding sequence 0, and invalidates
+user-text branches plus computed distributions. This avoids retaining the old
+prefix while allocating the new one. If rebuilding fails, the worker exits
+rather than serving stale logits, and the adapter falls back to PPM.
 
 UI: a `ctx N` chip appears while a block is active. A preview panel shows the
 post-cap text for ~6 s after capture (hidden while steering); left-clicking the
@@ -631,9 +639,10 @@ Transient surface failures are classified explicitly: `Timeout` retries,
 ### 7.4 Settings
 
 **Not implemented.** There is no settings window; `egui` is not a dependency.
-Runtime configuration today is environment variables (§9) plus on-canvas
-affordances: the scroll wheel adjusts the speed cap (clamped to 1–10 bits/s) in
-both frontends, and `+`/`-` and `Esc` additionally work in the winit frontend
+Runtime configuration today is environment variables and the startup-loaded
+instructions file (§9), plus on-canvas affordances: the scroll wheel adjusts the
+speed cap (clamped to 1–10 bits/s) in both frontends, and `+`/`-` and `Esc`
+additionally work in the winit frontend
 (the layer-shell surface takes no keyboard input by design).
 A separate `egui` window covering model selection,
 speed caps, alphabet, injection backend, and telemetry opt-in remains the plan
@@ -703,10 +712,44 @@ M3 findings (from the foot-under-headless-sway harness, §11):
 
 ## 9. Configuration & persistence
 
-**There is no config file yet.** `$XDG_CONFIG_HOME/keyb/config.toml` (model path,
-threads, speed, alphabet, injection preferences, novice mode) is planned for M4
-along with the settings UI (§7.4) and data-driven alphabets (§5.4). Everything is
-currently an environment variable or a compiled-in default:
+**There is no general-purpose config file yet.**
+`$XDG_CONFIG_HOME/keyb/config.toml` (model path, threads, speed, alphabet,
+injection preferences, novice mode) is planned for M4 along with the settings
+UI (§7.4) and data-driven alphabets (§5.4). The static LLM prompt has its own
+editable text file; other settings are environment variables or compiled-in
+defaults.
+
+### Editable static prompt
+
+- `$XDG_CONFIG_HOME/keyb/instructions.txt`, falling back to
+  `$HOME/.config/keyb/instructions.txt`. Empty or relative XDG paths are ignored;
+  HOME must also be absolute. An unavailable config directory is nonfatal.
+- Loaded once at startup by `keyb-app`, which creates the parent directory and
+  default file when missing. Creation must not overwrite an existing file,
+  including a dangling symlink. Deleting the file and restarting restores the
+  default. Edits require an app restart; there is no live reload or editor UI.
+- The file contains the **entire static prompt**, initially:
+  `What follows is ordinary English text, with normal capitalization and punctuation, as someone types it out one character at a time.`
+  The initial file ends with two newlines, matching the previous compiled-in
+  preamble exactly. Users may replace or extend it freely.
+- The model crate receives the prompt as `LlamaConfig::system_prompt`; it does
+  no configuration-file I/O. This is a plain-text completion prefix, not a chat
+  role/template. No built-in instructions are prepended. Missing separating
+  newlines are added before the dynamic input; user content is otherwise
+  preserved. Order: configured prompt, optional framed captured context (§6.8),
+  recent committed text (§6.5). Context capture, clearing, and reset retain the
+  configured prompt. PPM-only mode ignores instructions.
+- Reads are bounded to **64 KiB**. Empty/whitespace-only, unreadable, invalid
+  UTF-8, or oversized files produce a stderr warning and use the default without
+  modifying the existing file. Tokenization errors also warn and use the default.
+- Before warming the prefix, the worker validates the prompt (including its
+  separator) against a maximum of **1024 model tokens**, further limited by the
+  actual context capacity minus 1024 captured-context tokens, an 800-symbol
+  byte-token worst-case typed window, and 32 tokens of headroom. Oversized
+  instructions are rejected, never silently truncated. If even the default
+  cannot fit the model context, ordinary model-startup failure falls back to PPM.
+
+### Environment and data
 
 | Variable | Effect |
 |---|---|
@@ -740,8 +783,9 @@ currently an environment variable or a compiled-in default:
     reliably, the design's requirement that this toggle be visible rather than
     buried still stands and is unmet.
 - **Session replay logs and persisted adaptive-speed state are not implemented.**
-- The LLM context is primed with a short system preamble + recent committed text
-  only (§6.5). Nothing leaves the machine after the one-time model download.
+- The LLM input is the configured static prompt + optional captured context +
+  recent committed text (§6.5–6.8). Instructions remain local; nothing leaves
+  the machine after the one-time model download.
 
 ## 10. Performance budgets (mid-range 2020s laptop, CPU-only)
 

@@ -8,7 +8,10 @@ use keyb_core::{Alphabet, LanguageModel};
 use keyb_lm_llama::{LlamaConfig, LlamaLm};
 
 fn lm_or_skip() -> Option<(LlamaLm, Alphabet)> {
-    let cfg = LlamaConfig::default();
+    lm_with_config_or_skip(LlamaConfig::default())
+}
+
+fn lm_with_config_or_skip(cfg: LlamaConfig) -> Option<(LlamaLm, Alphabet)> {
     if !cfg.model_path.exists() {
         eprintln!("skipping: no model at {}", cfg.model_path.display());
         return None;
@@ -166,4 +169,68 @@ fn context_block_reaches_the_model_and_clears() {
         tv_clear < 0.01,
         "clearing must restore preamble-only conditioning (tv={tv_clear:.4})"
     );
+}
+
+fn total_variation(left: &[f64], right: &[f64]) -> f64 {
+    0.5 * left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f64>()
+}
+
+#[test]
+fn full_custom_prompt_reaches_model_and_survives_context_changes() {
+    let Some((mut default_lm, _)) = lm_or_skip() else {
+        return;
+    };
+    let default = upgraded(&mut default_lm, b"", Duration::from_secs(15));
+    drop(default_lm);
+    let cfg = LlamaConfig {
+        system_prompt: "A shopping list of fruit:\n- apples\n- bananas\n- oranges\n-".into(),
+        ..LlamaConfig::default()
+    };
+    let (mut lm, _) = lm_with_config_or_skip(cfg).unwrap();
+    let custom = upgraded(&mut lm, b"", Duration::from_secs(15));
+    assert!(
+        total_variation(&default, &custom) > 0.01,
+        "custom prompt must affect predictions"
+    );
+
+    for context in [
+        "alice: what should we buy for dinner?".to_owned(),
+        "the council meets on thursday.\n".repeat(200),
+    ] {
+        lm.set_context(Some(&context));
+        let with_context = upgraded(&mut lm, b"", Duration::from_secs(60));
+        assert!((with_context.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        lm.set_context(None);
+        let cleared = upgraded(&mut lm, b"", Duration::from_secs(15));
+        assert!(
+            total_variation(&custom, &cleared) < 0.01,
+            "clearing context must restore the custom prompt, not the built-in one"
+        );
+    }
+}
+
+#[test]
+fn unusable_prompts_fall_back_to_default_with_real_tokenizer() {
+    let Some((mut default_lm, _)) = lm_or_skip() else {
+        return;
+    };
+    let default = upgraded(&mut default_lm, b"", Duration::from_secs(15));
+    drop(default_lm);
+    // The first prompt is under the byte limit but exceeds the token limit.
+    for system_prompt in ["word ".repeat(1500), "\0".to_owned(), " \n\t".to_owned()] {
+        let cfg = LlamaConfig {
+            system_prompt,
+            ..LlamaConfig::default()
+        };
+        let (mut lm, _) = lm_with_config_or_skip(cfg).unwrap();
+        let actual = upgraded(&mut lm, b"", Duration::from_secs(15));
+        assert!(
+            total_variation(&default, &actual) < 1e-4,
+            "invalid prompt must restore default conditioning"
+        );
+    }
 }

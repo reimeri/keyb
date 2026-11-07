@@ -26,7 +26,9 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 
 use crate::marginal::VocabIndex;
-use crate::LlamaConfig;
+use crate::{
+    LlamaConfig, DEFAULT_SYSTEM_PROMPT, MAX_SYSTEM_PROMPT_BYTES, MAX_SYSTEM_PROMPT_TOKENS,
+};
 
 #[derive(Debug)]
 pub enum ToWorker {
@@ -104,10 +106,102 @@ const WINDOW_STEP: usize = 256;
 /// chat template.
 const CONTEXT_HEADER: &str = "The writer is replying to the following text:\n";
 const CONTEXT_TAIL: &str = "\n\nThe writer's reply:\n";
-/// Token budget for the context block body (header and tail excluded):
-/// tail-trimmed so the most recent lines always survive. Preamble (~30) +
-/// block (~1050) + window (~250) stays well under `n_ctx`.
+/// Token budget for the full framed context block. The body is tail-trimmed
+/// so the most recent lines survive. Reserved separately from the static prompt.
 const CONTEXT_MAX_TOKENS: usize = 1024;
+
+/// Reserve a byte-token worst case for the 800-symbol window plus one healed
+/// continuation and some headroom. The static prompt can never take this space
+/// or the captured-context block's budget.
+fn prompt_token_budget(n_ctx: u32, max_symbol_bytes: usize) -> usize {
+    let reserved = CONTEXT_MAX_TOKENS + WINDOW * max_symbol_bytes + 32;
+    MAX_SYSTEM_PROMPT_TOKENS.min((n_ctx as usize).saturating_sub(reserved))
+}
+
+fn validated_prompt_tokens(
+    prompt: &str,
+    budget: usize,
+    tokenize: impl Fn(&str) -> Result<Vec<LlamaToken>, String>,
+) -> Result<Vec<LlamaToken>, String> {
+    if prompt.trim().is_empty() {
+        return Err("prompt is empty".into());
+    }
+    if prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
+        return Err(format!("prompt exceeds {MAX_SYSTEM_PROMPT_BYTES} bytes"));
+    }
+    // Preserve user content; only add missing separating newlines. In
+    // particular, the default prompt keeps exactly its existing tokenization.
+    let mut framed = prompt.to_owned();
+    if !framed.ends_with('\n') {
+        framed.push('\n');
+    }
+    if !framed.ends_with("\n\n") {
+        framed.push('\n');
+    }
+    let tokens = tokenize(&framed)?;
+    if tokens.is_empty() || tokens.len() > budget {
+        return Err(format!(
+            "prompt has {} tokens; allowed range is 1–{budget}",
+            tokens.len()
+        ));
+    }
+    Ok(tokens)
+}
+
+/// The static prompt is already validated and tokenized, and is reused on
+/// every context change. Only the captured body is ever tail-trimmed.
+fn assemble_prefix(
+    prompt: &[LlamaToken],
+    context: Option<&str>,
+    tokenize: impl Fn(&str) -> Result<Vec<LlamaToken>, String>,
+) -> Result<Vec<LlamaToken>, String> {
+    let mut tokens = prompt.to_vec();
+    if let Some(context) = context {
+        let head = tokenize(CONTEXT_HEADER)?;
+        let mut body = tokenize(context)?;
+        let tail = tokenize(CONTEXT_TAIL)?;
+        let budget = CONTEXT_MAX_TOKENS.saturating_sub(head.len() + tail.len());
+        if body.len() > budget {
+            body.drain(..body.len() - budget);
+        }
+        tokens.extend(head);
+        tokens.extend(body);
+        tokens.extend(tail);
+    }
+    Ok(tokens)
+}
+
+/// Decode a sequence in logical-batch-sized chunks, using absolute positions.
+/// Only the final token needs logits. This also handles long captured blocks
+/// on backends whose n_batch is smaller than the total pinned prefix.
+fn decode_tokens(
+    ctx: &mut LlamaContext<'_>,
+    tokens: &[LlamaToken],
+    start: i32,
+    seq: i32,
+) -> Result<Arc<[f32]>, String> {
+    if tokens.is_empty() {
+        return Err("cannot decode an empty sequence".into());
+    }
+    let batch_size = (ctx.n_batch() as usize).max(1);
+    for (chunk_index, chunk) in tokens.chunks(batch_size).enumerate() {
+        let offset = chunk_index * batch_size;
+        let mut batch = LlamaBatch::new(chunk.len(), 1);
+        for (i, &token) in chunk.iter().enumerate() {
+            batch
+                .add(
+                    token,
+                    start + (offset + i) as i32,
+                    &[seq],
+                    offset + i + 1 == tokens.len(),
+                )
+                .map_err(|e| format!("batch add: {e}"))?;
+        }
+        ctx.decode(&mut batch).map_err(|e| format!("decode: {e}"))?;
+    }
+    let last_index = ((tokens.len() - 1) % batch_size) as i32;
+    Ok(softmax(ctx.get_logits_ith(last_index)).into())
+}
 
 struct Branch {
     seq: i32,
@@ -124,6 +218,8 @@ struct Worker<'m> {
     /// Length of the pinned prefix (preamble + optional context block) —
     /// the position offset of every user-text token.
     n_preamble: i32,
+    /// Full static prompt, including separator, reused across context rebuilds.
+    system_prompt_tokens: Vec<LlamaToken>,
     /// The captured context block as last accepted (`None` = preamble only).
     context_text: Option<String>,
     /// Context generation: bumped per accepted `SetContext`, stamped onto
@@ -155,54 +251,28 @@ impl<'m> Worker<'m> {
     /// tokenized separately so the budget trims exactly the body; the
     /// boundaries fall on newlines, where BPE merging is a no-op in practice.
     fn prefix_tokens(&self) -> Result<Vec<LlamaToken>, String> {
-        let mut toks = self
-            .model
-            .str_to_token(PREAMBLE, AddBos::Never)
-            .map_err(|e| format!("preamble tokenize: {e}"))?;
-        if let Some(ctx) = &self.context_text {
-            let head = self
-                .model
-                .str_to_token(CONTEXT_HEADER, AddBos::Never)
-                .map_err(|e| format!("context header tokenize: {e}"))?;
-            let mut body = self
-                .model
-                .str_to_token(ctx, AddBos::Never)
-                .map_err(|e| format!("context tokenize: {e}"))?;
-            let tail = self
-                .model
-                .str_to_token(CONTEXT_TAIL, AddBos::Never)
-                .map_err(|e| format!("context tail tokenize: {e}"))?;
-            let budget = CONTEXT_MAX_TOKENS.saturating_sub(head.len() + tail.len());
-            if body.len() > budget {
-                body.drain(..body.len() - budget);
-            }
-            toks.extend_from_slice(&head);
-            toks.extend_from_slice(&body);
-            toks.extend_from_slice(&tail);
-        }
-        Ok(toks)
+        assemble_prefix(
+            &self.system_prompt_tokens,
+            self.context_text.as_deref(),
+            |text| {
+                self.model
+                    .str_to_token(text, AddBos::Never)
+                    .map_err(|e| format!("prefix tokenize: {e}"))
+            },
+        )
     }
 
-    /// Decode the pinned prefix into sequence 0, replacing the pinned
-    /// empty-key branch's distribution. Callers changing the context block
-    /// must flush all other branches right after: their KV shares prefix
-    /// cells with seq 0, which this rewrites.
+    /// Decode the pinned prefix into sequence 0. Release all old KV sequences
+    /// first: otherwise branches sharing the old prefix can exhaust capacity
+    /// while the new prefix is decoded. Callers must invalidate branch metadata
+    /// immediately afterwards, before servicing any new prediction.
     fn rebuild_prefix(&mut self) -> Result<(), String> {
         let toks = self.prefix_tokens()?;
         self.ctx
-            .clear_kv_cache_seq(Some(0), None, None)
+            .clear_kv_cache_seq(None, None, None)
             .map_err(|e| format!("kv clear: {e}"))?;
-        let mut batch = LlamaBatch::new(toks.len(), 1);
-        for (i, &t) in toks.iter().enumerate() {
-            batch
-                .add(t, i as i32, &[0], i + 1 == toks.len())
-                .map_err(|e| format!("batch add: {e}"))?;
-        }
-        self.ctx
-            .decode(&mut batch)
-            .map_err(|e| format!("prefix decode: {e}"))?;
+        let probs = decode_tokens(&mut self.ctx, &toks, 0, 0)?;
         self.n_preamble = toks.len() as i32;
-        let probs: Arc<[f32]> = softmax(self.ctx.get_logits_ith(batch.n_tokens() - 1)).into();
         self.tick += 1;
         self.branches.insert(
             Vec::new().into_boxed_slice(),
@@ -275,18 +345,7 @@ impl<'m> Worker<'m> {
                 Some((self.n_preamble + k as i32) as u32),
             )
             .map_err(|e| format!("kv copy: {e}"))?;
-        let tail = &tokens[k..];
-        let mut batch = LlamaBatch::new(tail.len(), 1);
-        for (i, &t) in tail.iter().enumerate() {
-            let pos = self.n_preamble + (k + i) as i32;
-            batch
-                .add(t, pos, &[seq], i + 1 == tail.len())
-                .map_err(|e| format!("batch add: {e}"))?;
-        }
-        self.ctx
-            .decode(&mut batch)
-            .map_err(|e| format!("decode: {e}"))?;
-        Ok(softmax(self.ctx.get_logits_ith(batch.n_tokens() - 1)).into())
+        decode_tokens(&mut self.ctx, &tokens[k..], self.n_preamble + k as i32, seq)
     }
 
     /// Free the least-recently-used branch (never the pinned preamble at the
@@ -391,12 +450,20 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Preamble priming the model toward the register it will predict: ordinary
-/// prose with normal capitalization and punctuation — the full alphabet
-/// includes capitals, digits, and symbols behind group boxes, so the prompt
-/// must not steer mass away from them. SPEC §9.
-const PREAMBLE: &str = "What follows is ordinary English text, with normal capitalization \
-and punctuation, as someone types it out one character at a time.\n\n";
+// Shared by production workers and optional real-model unit tests. llama.cpp
+// may initialize its backend only once per process.
+fn inference_backend() -> Result<&'static LlamaBackend, String> {
+    static BACKEND: std::sync::OnceLock<Result<LlamaBackend, String>> = std::sync::OnceLock::new();
+    BACKEND
+        .get_or_init(|| {
+            llama_cpp_2::send_logs_to_tracing(
+                llama_cpp_2::LogOptions::default().with_logs_enabled(false),
+            );
+            LlamaBackend::init().map_err(|e| format!("backend: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 pub fn run(
     cfg: LlamaConfig,
@@ -405,20 +472,8 @@ pub fn run(
     tx: Sender<FromWorker>,
     ready: Sender<Result<(), String>>,
 ) {
-    // llama.cpp's backend is process-global and may only be initialized once
-    // (several workers exist under `cargo test`).
-    static BACKEND: std::sync::OnceLock<Result<LlamaBackend, String>> = std::sync::OnceLock::new();
     let setup = || -> Result<(&'static LlamaBackend, LlamaModel), String> {
-        let backend = BACKEND
-            .get_or_init(|| {
-                // llama.cpp chats on stderr by default; an OSK has no use for it.
-                llama_cpp_2::send_logs_to_tracing(
-                    llama_cpp_2::LogOptions::default().with_logs_enabled(false),
-                );
-                LlamaBackend::init().map_err(|e| format!("backend: {e}"))
-            })
-            .as_ref()
-            .map_err(Clone::clone)?;
+        let backend = inference_backend()?;
         let params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(backend, &cfg.model_path, &params)
             .map_err(|e| format!("load {}: {e}", cfg.model_path.display()))?;
@@ -458,12 +513,37 @@ pub fn run(
         &alphabet,
     );
 
+    let max_symbol_bytes = (0..alphabet.len())
+        .map(|symbol| alphabet.char_of(symbol as u8).len_utf8())
+        .max()
+        .unwrap_or(1);
+    let budget = prompt_token_budget(ctx.n_ctx(), max_symbol_bytes);
+    let tokenize = |text: &str| {
+        model
+            .str_to_token(text, AddBos::Never)
+            .map_err(|e| format!("prompt tokenize: {e}"))
+    };
+    let system_prompt_tokens = match validated_prompt_tokens(&cfg.system_prompt, budget, tokenize) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            eprintln!("keyb-lm-llama: instructions.txt system prompt: {error} — using default prompt; file left unchanged");
+            match validated_prompt_tokens(DEFAULT_SYSTEM_PROMPT, budget, tokenize) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let _ = ready.send(Err(format!("default prompt cannot fit context: {error}")));
+                    return;
+                }
+            }
+        }
+    };
+
     let mut w = Worker {
         model: &model,
         ctx,
         vocab,
         alphabet,
         n_preamble: 0,
+        system_prompt_tokens,
         context_text: None,
         gen: 0,
         max_branches: cfg.max_branches,
@@ -550,10 +630,13 @@ pub fn run(
                     }
                     w.gen = gen;
                     if let Err(e) = w.rebuild_prefix() {
-                        // seq 0 may hold a partially rewritten prefix; the
-                        // flush below still applies, so prediction degrades
-                        // (PPM-heavy) rather than serving stale context.
-                        eprintln!("keyb-lm-llama: context prefix rebuild: {e}");
+                        // No valid pinned branch remains after a partial
+                        // decode. Exit so the adapter falls back to PPM rather
+                        // than reusing logits from the replaced context.
+                        eprintln!(
+                            "keyb-lm-llama: context prefix rebuild: {e} — running on PPM only"
+                        );
+                        return;
                     }
                     // Every user-text branch shares prefix cells with seq 0
                     // and every computed distribution was conditioned on the
@@ -639,7 +722,152 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::same_context_adopt_generation;
+    use super::*;
+
+    fn byte_tokens(text: &str) -> Result<Vec<LlamaToken>, String> {
+        Ok(text.bytes().map(|byte| LlamaToken(byte as i32)).collect())
+    }
+
+    #[test]
+    fn default_config_preserves_the_original_prompt_exactly() {
+        let cfg = LlamaConfig::default();
+        assert_eq!(cfg.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(
+            validated_prompt_tokens(&cfg.system_prompt, 1024, byte_tokens).unwrap(),
+            byte_tokens(DEFAULT_SYSTEM_PROMPT).unwrap()
+        );
+    }
+
+    #[test]
+    fn custom_prompt_is_not_prefixed_with_hidden_instructions() {
+        for text in ["Use Finnish.", "Use Finnish.\n", "Use Finnish.\n\n"] {
+            let tokens = validated_prompt_tokens(text, 1024, byte_tokens).unwrap();
+            assert_eq!(tokens, byte_tokens("Use Finnish.\n\n").unwrap());
+        }
+        let text = "Use Finnish.  \n\n\n";
+        assert_eq!(
+            validated_prompt_tokens(text, 1024, byte_tokens).unwrap(),
+            byte_tokens(text).unwrap()
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_oversized_and_untokenizable_prompts() {
+        for text in ["", " \t\n"] {
+            assert!(validated_prompt_tokens(text, 1024, byte_tokens).is_err());
+        }
+        let oversized = "a".repeat(MAX_SYSTEM_PROMPT_BYTES + 1);
+        assert!(validated_prompt_tokens(&oversized, 1024, |_| panic!(
+            "must reject before tokenization"
+        ))
+        .is_err());
+        // With this mock tokenizer the two separating newlines count too.
+        assert!(validated_prompt_tokens("abcd", 5, byte_tokens).is_err());
+        assert_eq!(
+            validated_prompt_tokens("abcd", 6, byte_tokens)
+                .unwrap()
+                .len(),
+            6
+        );
+        assert!(validated_prompt_tokens("a", 0, byte_tokens).is_err());
+        assert!(validated_prompt_tokens("a", 1024, |_| Ok(vec![])).is_err());
+        assert!(validated_prompt_tokens("a", 1024, |_| Err("tokenizer error".into())).is_err());
+    }
+
+    #[test]
+    fn token_budget_reserves_context_and_worst_case_typed_window() {
+        assert_eq!(prompt_token_budget(4096, 1), MAX_SYSTEM_PROMPT_TOKENS);
+        assert_eq!(prompt_token_budget(2048, 1), 192);
+        assert_eq!(prompt_token_budget(1024, 1), 0);
+        assert_eq!(prompt_token_budget(4096, 4), 0);
+    }
+
+    #[test]
+    fn context_changes_preserve_full_custom_prompt_and_clear_to_it() {
+        let prompt = validated_prompt_tokens("My own instructions.", 1024, byte_tokens).unwrap();
+        for context in [None, Some("first context"), Some("second context"), None] {
+            let actual = assemble_prefix(&prompt, context, byte_tokens).unwrap();
+            let mut expected = prompt.clone();
+            if let Some(context) = context {
+                expected.extend(
+                    byte_tokens(&format!("{CONTEXT_HEADER}{context}{CONTEXT_TAIL}")).unwrap(),
+                );
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn long_context_trims_only_the_body_not_the_static_prompt() {
+        let prompt = validated_prompt_tokens("My own instructions.", 1024, byte_tokens).unwrap();
+        let context = format!("{}latest lines", "x".repeat(2048));
+        let actual = assemble_prefix(&prompt, Some(&context), byte_tokens).unwrap();
+        assert_eq!(&actual[..prompt.len()], &prompt);
+        assert_eq!(actual.len(), prompt.len() + CONTEXT_MAX_TOKENS);
+        let suffix = byte_tokens(&format!("latest lines{CONTEXT_TAIL}")).unwrap();
+        assert!(actual.ends_with(&suffix));
+    }
+
+    /// Optional real-model regression: force a much smaller batch limit than
+    /// the prefix and compare chunked decoding to explicit reference batches.
+    /// Keep batch shapes identical: quantized kernels can produce measurably
+    /// different probabilities for different matrix multiplication shapes.
+    #[test]
+    fn long_prefix_decodes_in_batches_with_correct_positions_and_logits() {
+        let cfg = LlamaConfig::default();
+        if !cfg.model_path.exists() {
+            eprintln!("skipping: no model at {}", cfg.model_path.display());
+            return;
+        }
+        let backend = inference_backend().unwrap();
+        let model =
+            LlamaModel::load_from_file(backend, &cfg.model_path, &LlamaModelParams::default())
+                .unwrap();
+        let params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(4096))
+            .with_n_batch(32)
+            .with_n_ubatch(32)
+            .with_n_threads(2)
+            .with_n_threads_batch(2);
+        let mut ctx = model.new_context(backend, params).unwrap();
+        let tokens = model
+            .str_to_token(
+                &"ordinary English text with punctuation. ".repeat(20),
+                AddBos::Never,
+            )
+            .unwrap();
+        assert!(tokens.len() > ctx.n_batch() as usize);
+        let chunked = decode_tokens(&mut ctx, &tokens, 0, 0).unwrap();
+        let reference_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(4096))
+            .with_n_batch(32)
+            .with_n_ubatch(32)
+            .with_n_threads(2)
+            .with_n_threads_batch(2);
+        let mut reference_ctx = model.new_context(backend, reference_params).unwrap();
+        let mut batch = LlamaBatch::new(32, 1);
+        let mut last_index = 0;
+        for (position, &token) in tokens.iter().enumerate() {
+            last_index = batch.n_tokens();
+            batch
+                .add(token, position as i32, &[0], position + 1 == tokens.len())
+                .unwrap();
+            if batch.n_tokens() == 32 || position + 1 == tokens.len() {
+                reference_ctx.decode(&mut batch).unwrap();
+                batch.clear();
+            }
+        }
+        let reference = softmax(reference_ctx.get_logits_ith(last_index));
+        let distance: f64 = chunked
+            .iter()
+            .zip(reference)
+            .map(|(a, b)| (*a as f64 - b as f64).abs())
+            .sum();
+        assert!(
+            distance < 1e-3,
+            "chunked decode changed distribution: {distance}"
+        );
+    }
 
     #[test]
     fn unchanged_context_adopts_new_generation_without_rebuild() {

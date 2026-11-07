@@ -18,9 +18,23 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use keyb_core::{Alphabet, LanguageModel};
 use keyb_lm_ppm::PpmModel;
 
+/// Initial contents of the user-editable system prompt file (SPEC §9).
+/// This is a plain-text completion prefix, not a separate chat-role message.
+pub const DEFAULT_SYSTEM_PROMPT: &str =
+    "What follows is ordinary English text, with normal capitalization \
+and punctuation, as someone types it out one character at a time.\n\n";
+
+/// Bound file reads and tokenization work before checking the model token budget.
+pub const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
+/// Maximum static prompt length, including its separating newlines. Smaller
+/// context windows may impose a lower limit to preserve room for dynamic text.
+pub const MAX_SYSTEM_PROMPT_TOKENS: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub struct LlamaConfig {
     pub model_path: PathBuf,
+    /// Full static prompt; no built-in instructions are prepended.
+    pub system_prompt: String,
     pub n_threads: i32,
     /// Total KV cells shared by all branches (unified cache).
     pub n_ctx: u32,
@@ -36,6 +50,7 @@ impl Default for LlamaConfig {
     fn default() -> Self {
         LlamaConfig {
             model_path: default_model_path(),
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
             n_threads: (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).clamp(2, 8)
                 as i32,
             n_ctx: 4096,

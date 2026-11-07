@@ -6,6 +6,7 @@ use keyb_lm_ppm::{Personalized, PpmModel};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+mod instructions;
 mod model_download;
 
 fn configured_model(model_override: Option<OsString>) -> (LlamaConfig, bool) {
@@ -37,7 +38,8 @@ fn user_model_path() -> PathBuf {
 /// Provision and load the default LLM (`KEYB_MODEL` selects a user-managed
 /// file), falling back to PPM so download and load failures never prevent use.
 fn language_model(alphabet: &Alphabet) -> Box<dyn LanguageModel> {
-    let (cfg, managed_default) = configured_model(std::env::var_os("KEYB_MODEL"));
+    let (mut cfg, managed_default) = configured_model(std::env::var_os("KEYB_MODEL"));
+    cfg.system_prompt = instructions::load();
     if managed_default && !env_flag("KEYB_NO_MODEL_DOWNLOAD") {
         if let Err(error) = model_download::ensure_default_model(&cfg.model_path) {
             eprintln!("keyb: model download failed: {error:#} — running on PPM only");

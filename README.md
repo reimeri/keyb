@@ -111,6 +111,45 @@ context block is also dumped to `$XDG_STATE_HOME/keyb/last_context.txt` (or
 `$HOME/.local/state/keyb/last_context.txt`) so you can check exactly what the
 model was promised.
 
+## Custom prediction instructions
+
+The full static LLM prompt is editable at
+`$XDG_CONFIG_HOME/keyb/instructions.txt`, or
+`~/.config/keyb/instructions.txt` when `XDG_CONFIG_HOME` is unset. Empty or
+relative XDG paths are ignored in favor of the home-directory fallback. On
+first startup, keyb creates the file with its existing default:
+
+```text
+What follows is ordinary English text, with normal capitalization and punctuation, as someone types it out one character at a time.
+```
+
+Edit this UTF-8 file to change the wording or add instructions, then **restart
+keyb**. For example, keep the default sentence and add:
+
+```text
+The writer uses British English, concise sentences, and a friendly tone.
+```
+
+The file replaces the entire static prompt; keyb does not prepend hidden
+instructions. It is a plain-text model prefix, not a separate chat-role
+message. Prediction input is the prompt (with separating newlines), followed
+by any captured reply context and the recent text being typed. Capturing or
+clearing context does not change your configured instructions. Instructions
+influence predictions; they are not a guarantee of model behavior and do not
+change the available alphabet. PPM-only mode does not use them.
+
+Missing files are recreated with the default. Empty/whitespace-only,
+unreadable, invalid UTF-8, or oversized files produce a warning on stderr and
+use the default **without overwriting your file**. File reads are capped at
+64 KiB; the prompt including separating newlines must fit within 1024 model
+tokens (less for smaller model context windows), reserving capacity for
+captured context and typed text. Untokenizable prompts also fall back to the
+default. If the config directory cannot be located or created, keyb still
+runs with the default prompt.
+
+To restore the default permanently, delete `instructions.txt` and restart
+keyb. No settings window or live reload is required or provided.
+
 ## Environment variables
 
 | Variable | Effect |
